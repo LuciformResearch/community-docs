@@ -73,10 +73,12 @@ const execAsync = promisify(exec);
 /**
  * Clone a GitHub repository to a temporary directory
  * Uses shallow clone (--depth 1) for speed
+ * Supports recursive submodule initialization
  */
 async function cloneGitHubRepo(
   githubUrl: string,
-  branch: string = "main"
+  branch: string = "main",
+  includeSubmodules: boolean = true
 ): Promise<{ tempDir: string; repoDir: string }> {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "github-ingest-"));
 
@@ -88,12 +90,14 @@ async function cloneGitHubRepo(
   const [, , repoName] = urlMatch;
   const repoDir = path.join(tempDir, repoName);
 
-  logger.info(`Cloning ${githubUrl} (branch: ${branch}) to ${tempDir}...`);
+  logger.info(`Cloning ${githubUrl} (branch: ${branch}, submodules: ${includeSubmodules}) to ${tempDir}...`);
 
   try {
     // Shallow clone for speed - only get the latest commit
-    await execAsync(`git clone --depth 1 --branch ${branch} ${githubUrl} ${repoDir}`, {
-      timeout: 120000, // 2 minutes timeout
+    // Use --recurse-submodules to also clone submodules
+    const submoduleFlag = includeSubmodules ? " --recurse-submodules --shallow-submodules" : "";
+    await execAsync(`git clone --depth 1 --branch ${branch}${submoduleFlag} ${githubUrl} ${repoDir}`, {
+      timeout: 300000, // 5 minutes timeout (submodules take longer)
     });
     logger.info(`Clone complete: ${repoDir}`);
     return { tempDir, repoDir };
@@ -773,9 +777,11 @@ export class CommunityAPIServer {
         branch?: string;
         maxFiles?: number;
         generateEmbeddings?: boolean;
+        /** Clone and ingest git submodules recursively (default: true) */
+        includeSubmodules?: boolean;
       };
     }>("/ingest/github", async (request, reply) => {
-      const { githubUrl, metadata, branch = "main", maxFiles = 1000, generateEmbeddings = true } = request.body || {};
+      const { githubUrl, metadata, branch = "main", maxFiles = 2000, generateEmbeddings = true, includeSubmodules = true } = request.body || {};
 
       // Validation (return JSON errors before switching to SSE)
       if (!githubUrl || !metadata) {
@@ -847,9 +853,9 @@ export class CommunityAPIServer {
       let tempDir: string | null = null;
 
       try {
-        // Phase 1: Clone repository
-        sendProgress("cloning", 0, 1, `Cloning ${githubUrl}...`);
-        const cloneResult = await cloneGitHubRepo(githubUrl, branch);
+        // Phase 1: Clone repository (with submodules if requested)
+        sendProgress("cloning", 0, 1, `Cloning ${githubUrl}${includeSubmodules ? " (with submodules)" : ""}...`);
+        const cloneResult = await cloneGitHubRepo(githubUrl, branch, includeSubmodules);
         tempDir = cloneResult.tempDir;
         const repoDir = cloneResult.repoDir;
         sendProgress("cloning", 1, 1, "Repository cloned");
