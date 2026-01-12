@@ -1,0 +1,3 @@
+[submodule "packages/ragforge-core"]
+	path = packages/ragforge-core
+	url = git@github.com:LuciformResearch/ragforge-core.git
