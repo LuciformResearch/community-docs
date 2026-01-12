@@ -51,6 +51,8 @@ import { EntityEmbeddingService, type EntitySearchOptions, type EntitySearchResu
 import { registerChatRoutes } from "./routes/chat";
 // Vision API Routes (image/PDF/3D analysis)
 import { registerVisionRoutes } from "./routes/vision";
+// Lucie Agent Conversation Routes
+import { registerLucieRoutes } from "./routes/lucie";
 // Core vision tools for ingestion
 import {
   getOCRService,
@@ -1728,6 +1730,13 @@ export class CommunityAPIServer {
     // Vision API Routes (image/PDF/3D analysis)
     // =========================================================================
     registerVisionRoutes(this.server);
+
+    // =========================================================================
+    // Lucie Agent Conversation Routes
+    // =========================================================================
+    registerLucieRoutes(this.server, {
+      neo4j: this.neo4j!,
+    });
   }
 
   async start(port: number = DEFAULT_PORT): Promise<void> {
