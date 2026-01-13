@@ -14,11 +14,19 @@ import Anthropic from "@anthropic-ai/sdk";
 // Types
 // ============================================================================
 
+interface LucieToolCall {
+  name: string;
+  args: Record<string, unknown>;
+  result: string;
+  preview: string;
+}
+
 interface LucieMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   timestamp: string;
+  toolCalls?: LucieToolCall[];  // Only for assistant messages
 }
 
 interface LucieSummary {
@@ -111,7 +119,8 @@ class LucieConversationService {
   async addMessage(
     conversationId: string,
     role: "user" | "assistant",
-    content: string
+    content: string,
+    toolCalls?: LucieToolCall[]
   ): Promise<{ messageId: string; shouldSummarize: boolean }> {
     const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -126,6 +135,9 @@ class LucieConversationService {
     const lastSummarized = this.extractInt(countResult.records[0]?.get("lastSummarized")) || 0;
     const turnIndex = currentCount + 1;
 
+    // Serialize tool calls to JSON string if provided
+    const toolCallsJson = toolCalls && toolCalls.length > 0 ? JSON.stringify(toolCalls) : null;
+
     // Add message
     await this.neo4j.run(
       `MATCH (c:LucieConversation {id: $conversationId})
@@ -135,11 +147,12 @@ class LucieConversationService {
          role: $role,
          content: $content,
          turnIndex: $turnIndex,
-         timestamp: datetime()
+         timestamp: datetime(),
+         toolCalls: $toolCallsJson
        })
        CREATE (c)-[:HAS_MESSAGE]->(m)
        SET c.messageCount = $turnIndex, c.updatedAt = datetime()`,
-      { conversationId, messageId, role, content, turnIndex: neo4jInt(turnIndex) }
+      { conversationId, messageId, role, content, turnIndex: neo4jInt(turnIndex), toolCallsJson }
     );
 
     // Check if we should create a summary
@@ -504,9 +517,10 @@ export function registerLucieRoutes(
       visitorId: string;
       role: "user" | "assistant";
       content: string;
+      toolCalls?: LucieToolCall[];  // Optional tool calls for assistant messages
     };
   }>("/lucie/message", async (request, reply) => {
-    const { visitorId, role, content } = request.body || {};
+    const { visitorId, role, content, toolCalls } = request.body || {};
 
     if (!visitorId || !role || !content) {
       reply.status(400);
@@ -518,7 +532,8 @@ export function registerLucieRoutes(
       const { messageId, shouldSummarize } = await service.addMessage(
         conversationId,
         role,
-        content
+        content,
+        toolCalls
       );
 
       // Create summary if needed (async, don't block response)
@@ -533,6 +548,7 @@ export function registerLucieRoutes(
         conversationId,
         messageId,
         summarizing: shouldSummarize,
+        hasToolCalls: !!toolCalls && toolCalls.length > 0,
       };
     } catch (error: any) {
       console.error(`[Lucie] Failed to add message: ${error.message}`);
@@ -614,10 +630,11 @@ export function registerLucieRoutes(
   // =========================================================================
   server.get<{
     Params: { visitorId: string };
-    Querystring: { limit?: string };
+    Querystring: { limit?: string; includeToolCalls?: string };
   }>("/lucie/history/:visitorId", async (request, reply) => {
     const { visitorId } = request.params;
     const limit = parseInt(request.query.limit || "50", 10);
+    const includeToolCalls = request.query.includeToolCalls === "true";
 
     if (!visitorId) {
       reply.status(400);
@@ -629,18 +646,34 @@ export function registerLucieRoutes(
 
       const messagesResult = await deps.neo4j.run(
         `MATCH (c:LucieConversation {id: $conversationId})-[:HAS_MESSAGE]->(m:LucieMessage)
-         RETURN m.id AS id, m.role AS role, m.content AS content, m.timestamp AS timestamp
+         RETURN m.id AS id, m.role AS role, m.content AS content, m.timestamp AS timestamp, m.toolCalls AS toolCalls
          ORDER BY m.turnIndex ASC
          LIMIT toInteger($limit)`,
         { conversationId, limit: neo4jInt(limit) }
       );
 
-      const messages = messagesResult.records.map((r) => ({
-        id: r.get("id"),
-        role: r.get("role"),
-        content: r.get("content"),
-        timestamp: r.get("timestamp")?.toString() || "",
-      }));
+      const messages = messagesResult.records.map((r) => {
+        const msg: LucieMessage = {
+          id: r.get("id"),
+          role: r.get("role"),
+          content: r.get("content"),
+          timestamp: r.get("timestamp")?.toString() || "",
+        };
+
+        // Parse and include tool calls if requested
+        if (includeToolCalls) {
+          const toolCallsJson = r.get("toolCalls");
+          if (toolCallsJson) {
+            try {
+              msg.toolCalls = JSON.parse(toolCallsJson);
+            } catch {
+              // Ignore parse errors
+            }
+          }
+        }
+
+        return msg;
+      });
 
       return {
         success: true,

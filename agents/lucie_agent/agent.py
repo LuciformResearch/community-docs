@@ -11,11 +11,14 @@ This implements a graph-based agent with intent routing:
 See ARCHITECTURE.md for full documentation.
 """
 
+import asyncio
 from typing import TypedDict, Annotated, Sequence, Literal
 from datetime import datetime
 from pathlib import Path
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_anthropic import ChatAnthropic
+from . import retry as retry_module
+from .retry import ChatAnthropicWithRetry, set_retry_event_queue
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
@@ -25,6 +28,16 @@ from .config import settings
 from .tools import ALL_TOOLS
 from .prompts import build_system_prompt
 from .summarizer import summarize_tool_calls, format_summaries_for_context, ToolCallSummary
+from .retry import is_rate_limit_error
+
+
+# Tool call type
+class ToolCall(TypedDict):
+    """A single tool call with args and result."""
+    name: str
+    args: dict
+    result: str
+    preview: str
 
 
 # Response type for run_agent
@@ -32,10 +45,14 @@ class AgentResponse(TypedDict):
     """Response from running the agent."""
     response: str
     tool_summary: ToolCallSummary | None
+    tool_calls: list[ToolCall]  # Raw tool calls for storage
 
 
 # Log file for agent/classifier
 AGENT_LOG_FILE = Path(__file__).parent / "agent.log"
+
+# Configure retry module to use the same log file
+retry_module.RETRY_LOG_FILE = AGENT_LOG_FILE
 
 
 def _log_agent(message: str):
@@ -65,42 +82,60 @@ Si la question est hors-sujet (pas liée à mon travail/projets), redirige polim
 """
 
 
-# Agent state with intent
+# Language type
+Language = Literal["FR", "EN"]
+
+# Agent state with intent and language
 class AgentState(TypedDict):
     """State for the agent graph."""
     messages: Annotated[Sequence[BaseMessage], add_messages]
     conversation_id: str
     intent: Intent | None
+    language: Language | None
 
 
-def create_agent():
-    """Create and return the compiled LangGraph agent with intent routing."""
+def create_agent(model_name: str | None = None):
+    """
+    Create and return the compiled LangGraph agent with intent routing.
 
-    # LLM for classification (fast, cheap)
-    classifier_llm = ChatAnthropic(
+    Args:
+        model_name: Override model name (default: settings.model_name)
+    """
+    use_model = model_name or settings.model_name
+    _log_agent(f"Creating agent with model: {use_model}")
+
+    # LLM for classification (fast, cheap) - always use Haiku
+    # Using ChatAnthropicWithRetry for proper exponential backoff on rate limits
+    classifier_llm = ChatAnthropicWithRetry(
         model="claude-3-5-haiku-20241022",
         api_key=settings.anthropic_api_key,
         temperature=0,
         max_tokens=50,
-        max_retries=3,  # Built-in retry for rate limits
+        # Custom retry config (shorter delays for classifier since it's fast)
+        retry_max_attempts=5,
+        retry_base_delay_ms=30000,  # 30 seconds for classifier (smaller requests)
     )
 
     # LLM for responses (with tools)
-    response_llm = ChatAnthropic(
-        model=settings.model_name,
+    # Using ChatAnthropicWithRetry for proper exponential backoff on rate limits
+    response_llm = ChatAnthropicWithRetry(
+        model=use_model,
         api_key=settings.anthropic_api_key,
         temperature=settings.temperature,
         max_tokens=4096,
-        max_retries=3,  # Built-in retry for rate limits
+        # Custom retry config (longer delays for main LLM due to larger requests)
+        retry_max_attempts=5,
+        retry_base_delay_ms=60000,  # 1 minute base delay
     ).bind_tools(ALL_TOOLS)
 
-    # LLM for responses (without tools - faster for simple responses)
-    simple_llm = ChatAnthropic(
-        model=settings.model_name,
+    # LLM for responses (without tools - always Haiku for speed/cost)
+    simple_llm = ChatAnthropicWithRetry(
+        model="claude-3-5-haiku-20241022",
         api_key=settings.anthropic_api_key,
         temperature=settings.temperature,
         max_tokens=2048,
-        max_retries=3,  # Built-in retry for rate limits
+        retry_max_attempts=5,
+        retry_base_delay_ms=30000,  # Shorter delay for Haiku
     )
 
     # Classifier node
@@ -117,9 +152,9 @@ def create_agent():
             if isinstance(msg, HumanMessage) and not user_message:
                 user_message = msg.content
             elif isinstance(msg, AIMessage) and not last_assistant_message:
-                # Get a snippet of the last assistant message for context
+                # Get the last assistant message for context (full content for better classification)
                 content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                last_assistant_message = content[:300] if len(content) > 300 else content
+                last_assistant_message = content
             if user_message and last_assistant_message:
                 break
 
@@ -131,16 +166,20 @@ def create_agent():
 Previous assistant message (for context): "{last_assistant_message}"
 """
 
-        classification_prompt = f"""Classify this message into ONE of these categories:
-- TECHNIQUE: Questions about projects, code, technologies, implementation details, OR follow-up/confirmation to technical discussions (like "oui", "ok", "continue")
-- PERSONNEL: Questions about background, experience, motivations, personality
-- CODE: Requests to see specific code examples or implementations
-- CONTACT: Questions about how to contact, email, social media, website
-- OFF_TOPIC: Anything clearly unrelated to CV, work, or projects
-{context_section}
-User message: "{user_message}"
+        classification_prompt = f"""Classify this message. Output ONLY "CATEGORY|LANG", nothing else.
 
-Reply with ONLY the category name (TECHNIQUE, PERSONNEL, CODE, CONTACT, or OFF_TOPIC):"""
+CATEGORIES:
+- TECHNIQUE: projects, code, tech, implementation, follow-ups like "ok/oui/continue"
+- PERSONNEL: background, experience, motivations, personality
+- CODE: requests to see specific code examples
+- CONTACT: email, social media, how to reach
+- OFF_TOPIC: unrelated to work/projects
+
+LANG: FR=French, EN=English/other
+{context_section}
+Message: "{user_message}"
+
+Output:"""
 
         # Log the full classifier prompt
         _log_agent(f"\n{'='*80}")
@@ -153,7 +192,14 @@ Reply with ONLY the category name (TECHNIQUE, PERSONNEL, CODE, CONTACT, or OFF_T
         _log_agent(f"{'-'*80}")
 
         response = classifier_llm.invoke([HumanMessage(content=classification_prompt)])
-        intent_text = response.content.strip().upper()
+        response_text = response.content.strip().upper()
+
+        # Parse intent and language (format: "CATEGORY|LANGUAGE")
+        # Only take the first line in case LLM adds extra text
+        first_line = response_text.split("\n")[0].strip()
+        parts = first_line.split("|")
+        intent_text = parts[0].strip() if parts else ""
+        language_text = parts[1].strip() if len(parts) > 1 else "EN"
 
         # Parse intent
         if "TECHNIQUE" in intent_text:
@@ -167,11 +213,46 @@ Reply with ONLY the category name (TECHNIQUE, PERSONNEL, CODE, CONTACT, or OFF_T
         else:
             intent = "OFF_TOPIC"
 
-        _log_agent(f"CLASSIFIER RESPONSE: {intent_text}")
-        _log_agent(f"PARSED INTENT: {intent}")
+        # Parse language
+        language: Language = "FR" if "FR" in language_text else "EN"
+
+        _log_agent(f"CLASSIFIER RAW RESPONSE: {repr(response_text)}")
+        _log_agent(f"FIRST LINE: {repr(first_line)}")
+        _log_agent(f"PARSED INTENT: {intent}, LANGUAGE: {language}")
         _log_agent(f"{'='*80}\n")
 
-        return {"intent": intent}
+        return {"intent": intent, "language": language}
+
+    # Helper to build messages with correct language prompt
+    def build_messages_for_llm(state: AgentState) -> list[BaseMessage]:
+        """Build message list with language-appropriate system prompt."""
+        language = state.get("language", "FR")
+        messages = list(state["messages"])
+
+        # Find and extract conversation context from original system message
+        conversation_context = None
+        human_messages = []
+
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                if "## Contexte de conversation" in content:
+                    parts = content.split("## Contexte de conversation")
+                    if len(parts) > 1:
+                        conversation_context = parts[1].strip()
+                elif "## Conversation context" in content:
+                    parts = content.split("## Conversation context")
+                    if len(parts) > 1:
+                        conversation_context = parts[1].strip()
+            else:
+                human_messages.append(msg)
+
+        # Build new system prompt with detected language
+        system_prompt = build_system_prompt(conversation_context, language)
+
+        _log_agent(f"[BUILD_MESSAGES] Language: {language}")
+
+        return [SystemMessage(content=system_prompt)] + human_messages
 
     # Route based on intent
     def route_by_intent(state: AgentState) -> str:
@@ -189,14 +270,14 @@ Reply with ONLY the category name (TECHNIQUE, PERSONNEL, CODE, CONTACT, or OFF_T
     # Agent with tools (for TECHNIQUE and CODE)
     def call_model_with_tools(state: AgentState) -> dict:
         """Call the LLM with tools for technical questions."""
-        messages = state["messages"]
+        messages = build_messages_for_llm(state)
         response = response_llm.invoke(messages)
         return {"messages": [response]}
 
     # Simple persona response (for PERSONNEL)
     def call_persona_response(state: AgentState) -> dict:
         """Direct persona response without tools."""
-        messages = state["messages"]
+        messages = build_messages_for_llm(state)
         response = simple_llm.invoke(messages)
         return {"messages": [response]}
 
@@ -208,7 +289,7 @@ Reply with ONLY the category name (TECHNIQUE, PERSONNEL, CODE, CONTACT, or OFF_T
     # Off-topic response (now uses LLM for context-aware redirection)
     def off_topic_response(state: AgentState) -> dict:
         """Redirect off-topic questions with context awareness."""
-        messages = state["messages"]
+        messages = build_messages_for_llm(state)
         response = simple_llm.invoke(messages)
         return {"messages": [response]}
 
@@ -236,7 +317,7 @@ Reply with ONLY the category name (TECHNIQUE, PERSONNEL, CODE, CONTACT, or OFF_T
     # Set entry point
     workflow.set_entry_point("classifier")
 
-    # Route from classifier based on intent
+    # Route from classifier based on intent (handlers build their own prompts with detected language)
     workflow.add_conditional_edges(
         "classifier",
         route_by_intent,
@@ -270,16 +351,25 @@ Reply with ONLY the category name (TECHNIQUE, PERSONNEL, CODE, CONTACT, or OFF_T
     return workflow.compile()
 
 
-# Global agent instance
-_agent = None
+# Global agent instances (primary and fallback)
+_primary_agent = None
+_fallback_agent = None
 
 
-def get_agent():
-    """Get or create the agent instance."""
-    global _agent
-    if _agent is None:
-        _agent = create_agent()
-    return _agent
+def get_agent(use_fallback: bool = False):
+    """Get or create the agent instance (primary or fallback)."""
+    global _primary_agent, _fallback_agent
+
+    if use_fallback:
+        if _fallback_agent is None:
+            _log_agent(f"Creating FALLBACK agent with model: {settings.fallback_model_name}")
+            _fallback_agent = create_agent(model_name=settings.fallback_model_name)
+        return _fallback_agent
+    else:
+        if _primary_agent is None:
+            _log_agent(f"Creating PRIMARY agent with model: {settings.model_name}")
+            _primary_agent = create_agent(model_name=settings.model_name)
+        return _primary_agent
 
 
 async def run_agent(
@@ -300,8 +390,8 @@ async def run_agent(
     """
     agent = get_agent()
 
-    # Build system prompt with context
-    system_prompt = build_system_prompt(conversation_context)
+    # Build initial system prompt (will be replaced after language detection)
+    system_prompt = build_system_prompt(conversation_context, "FR")
 
     # Create initial state
     initial_state: AgentState = {
@@ -311,6 +401,7 @@ async def run_agent(
         ],
         "conversation_id": conversation_id,
         "intent": None,
+        "language": None,
     }
 
     # Run the agent (retry logic is built into ChatAnthropic with max_retries)
@@ -335,7 +426,10 @@ async def run_agent(
             elif isinstance(msg, ToolMessage):
                 # Match tool result with the corresponding call
                 if tool_calls and not tool_calls[-1]["result"]:
-                    tool_calls[-1]["result"] = str(msg.content)
+                    result_str = str(msg.content)
+                    tool_calls[-1]["result"] = result_str
+                    # Add preview (first 500 chars)
+                    tool_calls[-1]["preview"] = result_str[:500] + "..." if len(result_str) > 500 else result_str
 
         # Extract the final AI message
         response_text = ""
@@ -375,14 +469,16 @@ async def run_agent(
 
         return {
             "response": response_text,
-            "tool_summary": tool_summary
+            "tool_summary": tool_summary,
+            "tool_calls": tool_calls
         }
 
     except Exception as e:
         _log_agent(f"❌ Agent error: {str(e)}")
         return {
             "response": f"Erreur lors de l'execution de l'agent: {str(e)}",
-            "tool_summary": None
+            "tool_summary": None,
+            "tool_calls": []
         }
 
 
@@ -396,11 +492,22 @@ async def run_agent_streaming(
 
     Yields chunks of the response as they are generated.
     Also captures tool calls and generates summaries.
-    """
-    agent = get_agent()
 
-    # Build system prompt with context
-    system_prompt = build_system_prompt(conversation_context)
+    Retry logic:
+    - Try with primary model (Sonnet)
+    - On rate limit: retry up to 2 times with exponential backoff
+    - After 2 failed retries: fallback to Haiku model
+    """
+    import random
+
+    # Retry configuration
+    MAX_RETRIES_BEFORE_FALLBACK = 2
+    BASE_DELAY_MS = 60000  # 1 minute
+    BACKOFF_MULTIPLIER = 1.5
+    MAX_JITTER_MS = 10000
+
+    # Build initial system prompt (will be replaced after language detection)
+    system_prompt = build_system_prompt(conversation_context, "FR")
 
     # Create initial state
     initial_state: AgentState = {
@@ -410,20 +517,29 @@ async def run_agent_streaming(
         ],
         "conversation_id": conversation_id,
         "intent": None,
+        "language": None,
     }
 
     config = {"recursion_limit": settings.max_iterations * 2}
 
-    # Track tool calls for summarization
-    tool_calls = []
-    current_tool = None
-    full_response = ""
+    async def stream_with_agent(agent, model_name: str):
+        """Inner function to stream with a specific agent."""
+        tool_calls = []
+        current_tool = None
+        full_response = ""
 
-    try:
         async for event in agent.astream_events(initial_state, config=config, version="v2"):
             kind = event.get("event")
 
+            # Get the current node from metadata to filter classifier tokens
+            metadata = event.get("metadata", {})
+            langgraph_node = metadata.get("langgraph_node", "")
+
             if kind == "on_chat_model_stream":
+                # Skip classifier tokens - only stream from response nodes
+                if langgraph_node == "classifier":
+                    continue
+
                 # Streaming token from the LLM
                 chunk = event.get("data", {}).get("chunk")
                 if chunk and hasattr(chunk, "content"):
@@ -448,22 +564,29 @@ async def run_agent_streaming(
                 tool_name = event.get("name", "unknown")
                 tool_input = event.get("data", {}).get("input", {})
                 current_tool = {"name": tool_name, "args": tool_input}
-                yield {"type": "tool_start", "name": tool_name}
+                yield {"type": "tool_start", "name": tool_name, "args": tool_input}
 
             elif kind == "on_tool_end":
                 # Tool finished
                 tool_name = event.get("name", "unknown")
-                output = event.get("data", {}).get("output", "")
+                raw_output = event.get("data", {}).get("output", "")
+                # Extract actual content from tool output
+                if hasattr(raw_output, "content"):
+                    output_str = str(raw_output.content)
+                elif isinstance(raw_output, dict) and "content" in raw_output:
+                    output_str = str(raw_output["content"])
+                else:
+                    output_str = str(raw_output)
                 if current_tool:
-                    current_tool["result"] = str(output)
+                    current_tool["result"] = output_str
                     tool_calls.append(current_tool)
                     current_tool = None
-                yield {"type": "tool_end", "name": tool_name, "output": str(output)[:500]}
+                yield {"type": "tool_end", "name": tool_name, "output": output_str}
 
         # Generate and yield summary if tools were called
         if tool_calls:
             _log_agent(f"\n{'='*80}")
-            _log_agent(f"GENERATING SUMMARY - {len(tool_calls)} tool call(s)")
+            _log_agent(f"GENERATING SUMMARY ({model_name}) - {len(tool_calls)} tool call(s)")
             _log_agent(f"Conversation: {conversation_id}")
             _log_agent(f"{'='*80}")
 
@@ -472,7 +595,6 @@ async def run_agent_streaming(
                 _log_agent(f"SUMMARY GENERATED:")
                 _log_agent(f"  key_findings: {summary['key_findings']}")
                 _log_agent(f"  assistant_action: {summary['assistant_action']}")
-                # Yield summary event for main.py to store via API
                 yield {
                     "type": "tool_summary",
                     "user_question": summary["user_question"],
@@ -482,5 +604,77 @@ async def run_agent_streaming(
                 }
             _log_agent(f"{'='*80}\n")
 
-    except Exception as e:
-        yield {"type": "error", "content": str(e)}
+    # Main retry loop
+    attempt = 0
+    use_fallback = False
+
+    while True:
+        try:
+            agent = get_agent(use_fallback=use_fallback)
+            model_name = settings.fallback_model_name if use_fallback else settings.model_name
+
+            _log_agent(f"[STREAM] Starting with model: {model_name} (attempt {attempt + 1}, fallback={use_fallback})")
+
+            # Yield model info for frontend
+            if use_fallback:
+                yield {"type": "model_fallback", "model": model_name}
+
+            async for event in stream_with_agent(agent, model_name):
+                yield event
+
+            # Success - exit retry loop
+            break
+
+        except Exception as e:
+            error_str = str(e)
+            _log_agent(f"[STREAM] Error on attempt {attempt + 1}: {error_str}")
+
+            # Check if it's a rate limit error
+            if not is_rate_limit_error(e):
+                _log_agent(f"[STREAM] Non-rate-limit error, not retrying")
+                yield {"type": "error", "content": error_str}
+                break
+
+            # Rate limit error - check if we should retry or fallback
+            if not use_fallback and attempt < MAX_RETRIES_BEFORE_FALLBACK:
+                # Calculate delay with exponential backoff + jitter
+                jitter = random.random() * MAX_JITTER_MS
+                delay_ms = BASE_DELAY_MS * (BACKOFF_MULTIPLIER ** attempt) + jitter
+                delay_seconds = delay_ms / 1000
+
+                _log_agent(f"[STREAM] Rate limited, retry {attempt + 1}/{MAX_RETRIES_BEFORE_FALLBACK} in {delay_seconds:.1f}s")
+
+                # Emit retry event for frontend
+                yield {
+                    "type": "rate_limit",
+                    "attempt": attempt + 1,
+                    "max_attempts": MAX_RETRIES_BEFORE_FALLBACK,
+                    "delay_seconds": round(delay_seconds, 1),
+                    "will_fallback": False,
+                }
+
+                await asyncio.sleep(delay_seconds)
+                attempt += 1
+
+            elif not use_fallback:
+                # Max retries reached, switch to fallback
+                _log_agent(f"[STREAM] Max retries reached, switching to fallback model: {settings.fallback_model_name}")
+
+                yield {
+                    "type": "rate_limit",
+                    "attempt": attempt + 1,
+                    "max_attempts": MAX_RETRIES_BEFORE_FALLBACK,
+                    "delay_seconds": 5,
+                    "will_fallback": True,
+                    "fallback_model": settings.fallback_model_name,
+                }
+
+                await asyncio.sleep(5)  # Short delay before fallback
+                use_fallback = True
+                attempt = 0  # Reset attempt counter for fallback
+
+            else:
+                # Even fallback failed - give up
+                _log_agent(f"[STREAM] Fallback model also rate limited, giving up")
+                yield {"type": "error", "content": f"Rate limit on both models: {error_str}"}
+                break

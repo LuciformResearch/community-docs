@@ -30,17 +30,30 @@ async def add_message(
     client: httpx.AsyncClient,
     visitor_id: str,
     role: str,
-    content: str
+    content: str,
+    tool_calls: list[dict] | None = None
 ) -> str:
-    """Add a message to a conversation."""
-    response = await client.post(
-        "/lucie/message",
-        json={
-            "visitorId": visitor_id,
-            "role": role,
-            "content": content
-        }
-    )
+    """Add a message to a conversation.
+
+    Args:
+        client: HTTP client
+        visitor_id: Visitor identifier
+        role: Message role ("user" or "assistant")
+        content: Message content
+        tool_calls: Optional list of tool calls for assistant messages
+                   Each tool call: {name, args, result, preview}
+    """
+    payload = {
+        "visitorId": visitor_id,
+        "role": role,
+        "content": content
+    }
+
+    # Add tool calls if provided (for assistant messages)
+    if tool_calls and len(tool_calls) > 0:
+        payload["toolCalls"] = tool_calls
+
+    response = await client.post("/lucie/message", json=payload)
     response.raise_for_status()
     data = response.json()
 

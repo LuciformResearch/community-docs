@@ -37,6 +37,11 @@ class Settings(BaseSettings):
         default="claude-sonnet-4-20250514",
         env="MODEL_NAME"
     )
+    fallback_model_name: str = Field(
+        default="claude-3-5-haiku-20241022",
+        env="FALLBACK_MODEL_NAME",
+        description="Fallback model when primary hits rate limits (Haiku has higher limits)"
+    )
     max_iterations: int = Field(
         default=10,
         env="MAX_ITERATIONS"

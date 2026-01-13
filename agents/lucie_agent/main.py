@@ -318,17 +318,19 @@ async def chat(request: Request, body: ChatRequest):
             result = await run_agent(body.message, conversation_id, context)
             response = result["response"]
             tool_summary = result.get("tool_summary")
+            tool_calls = result.get("tool_calls", [])
 
-            # Store assistant message
+            # Store assistant message with tool calls
             try:
-                await add_message(http_client, visitor_id, "assistant", response)
+                stored_tool_calls = tool_calls if tool_calls else None
+                await add_message(http_client, visitor_id, "assistant", response, stored_tool_calls)
+                if stored_tool_calls:
+                    print(f"[Lucie Agent] [{visitor_id}] Stored {len(stored_tool_calls)} tool call(s)")
             except Exception as e:
                 print(f"[Lucie Agent] Failed to store response: {e}")
 
             # Store tool summary if generated
-            tool_calls = []
             if tool_summary:
-                tool_calls = [{"name": t} for t in tool_summary.get("tools_used", [])]
                 try:
                     await add_tool_summary(
                         http_client,
@@ -374,6 +376,8 @@ async def chat(request: Request, body: ChatRequest):
 async def stream_response(message: str, visitor_id: str, conversation_id: str, context: str):
     """Generate SSE stream for chat response with real-time logging."""
     full_response = ""
+    tool_calls = []  # Collect tool calls for storage
+    current_tool = None  # Track current tool being called
 
     # Send start event with conversation ID
     yield f"event: start\ndata: {json.dumps({'conversationId': conversation_id, 'visitorId': visitor_id})}\n\n"
@@ -393,13 +397,26 @@ async def stream_response(message: str, visitor_id: str, conversation_id: str, c
 
             elif event_type == "tool_start":
                 tool_name = event.get("name", "unknown")
+                tool_args = event.get("args", {})
+                current_tool = {"name": tool_name, "args": tool_args}
                 log_tool_call(tool_name, "start")  # Real-time tool logging
-                yield f"event: tool_start\ndata: {json.dumps({'name': tool_name})}\n\n"
+                yield f"event: tool_start\ndata: {json.dumps({'name': tool_name, 'args': tool_args})}\n\n"
 
             elif event_type == "tool_end":
                 tool_name = event.get("name", "unknown")
+                tool_output = event.get("output", "")
+
+                # Store tool call for later
+                tool_calls.append({
+                    "name": tool_name,
+                    "args": current_tool.get("args", {}) if current_tool else {},
+                    "result": tool_output,
+                })
+                current_tool = None
+
                 log_tool_call(tool_name, "end")  # Real-time tool logging
-                yield f"event: tool_end\ndata: {json.dumps({'name': tool_name})}\n\n"
+                # Send full output to frontend
+                yield f"event: tool_end\ndata: {json.dumps({'name': tool_name, 'output': tool_output})}\n\n"
 
             elif event_type == "tool_summary":
                 # Store tool summary via API
@@ -416,14 +433,48 @@ async def stream_response(message: str, visitor_id: str, conversation_id: str, c
                 except Exception as e:
                     print(f"[Lucie Agent] Failed to store tool summary: {e}")
 
+            elif event_type == "rate_limit":
+                # Rate limit retry notification
+                attempt = event.get("attempt", 1)
+                max_attempts = event.get("max_attempts", 5)
+                delay_seconds = event.get("delay_seconds", 60)
+                will_fallback = event.get("will_fallback", False)
+                fallback_model = event.get("fallback_model", "")
+
+                # Log to conversation log
+                if will_fallback:
+                    _log_write(f"\n[RATE LIMIT] Switching to fallback model: {fallback_model}\n")
+                else:
+                    _log_write(f"\n[RATE LIMIT] Retry {attempt}/{max_attempts} in {delay_seconds}s...\n")
+
+                yield f"event: rate_limit\ndata: {json.dumps({'attempt': attempt, 'maxAttempts': max_attempts, 'delaySeconds': delay_seconds, 'willFallback': will_fallback, 'fallbackModel': fallback_model})}\n\n"
+
+            elif event_type == "model_fallback":
+                # Model fallback notification
+                model = event.get("model", "unknown")
+                _log_write(f"\n[FALLBACK] Now using model: {model}\n")
+                yield f"event: model_fallback\ndata: {json.dumps({'model': model})}\n\n"
+
             elif event_type == "error":
                 error = event.get("content", "Unknown error")
                 yield f"event: error\ndata: {json.dumps({'error': error})}\n\n"
 
-        # Store assistant message
+        # Store assistant message with tool calls
         if full_response and http_client:
             try:
-                await add_message(http_client, visitor_id, "assistant", full_response)
+                # Format tool calls for storage (only name, args, result)
+                stored_tool_calls = [
+                    {
+                        "name": tc["name"],
+                        "args": tc.get("args", {}),
+                        "result": tc.get("result", ""),
+                    }
+                    for tc in tool_calls
+                ] if tool_calls else None
+
+                await add_message(http_client, visitor_id, "assistant", full_response, stored_tool_calls)
+                if stored_tool_calls:
+                    print(f"[Lucie Agent] [{visitor_id}] Stored {len(stored_tool_calls)} tool call(s)")
             except Exception as e:
                 print(f"[Lucie Agent] Failed to store response: {e}")
             print(f"[Lucie Agent] [{visitor_id}] Assistant: {full_response[:100]}...")
