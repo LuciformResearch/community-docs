@@ -97,3 +97,46 @@ async def force_summarize(
         return None
 
     return data.get("summary")
+
+
+async def add_tool_summary(
+    client: httpx.AsyncClient,
+    visitor_id: str,
+    user_question: str,
+    tools_used: list[str],
+    key_findings: str,
+    assistant_action: str
+) -> Optional[str]:
+    """Add a tool call summary to the conversation."""
+    response = await client.post(
+        "/lucie/tool-summary",
+        json={
+            "visitorId": visitor_id,
+            "userQuestion": user_question,
+            "toolsUsed": tools_used,
+            "keyFindings": key_findings,
+            "assistantAction": assistant_action
+        }
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    if not data.get("success"):
+        return None
+
+    return data.get("summaryId")
+
+
+async def get_tool_summaries(
+    client: httpx.AsyncClient,
+    visitor_id: str
+) -> list[dict]:
+    """Get tool call summaries for a conversation."""
+    response = await client.get(f"/lucie/tool-summaries/{visitor_id}")
+    response.raise_for_status()
+    data = response.json()
+
+    if not data.get("success"):
+        return []
+
+    return data.get("toolSummaries", [])

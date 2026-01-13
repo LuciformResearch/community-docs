@@ -12,15 +12,39 @@ See ARCHITECTURE.md for full documentation.
 """
 
 from typing import TypedDict, Annotated, Sequence, Literal
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from datetime import datetime
+from pathlib import Path
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_anthropic import ChatAnthropic
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
+from collections import defaultdict
 
 from .config import settings
 from .tools import ALL_TOOLS
 from .prompts import build_system_prompt
+from .summarizer import summarize_tool_calls, format_summaries_for_context, ToolCallSummary
+
+
+# Response type for run_agent
+class AgentResponse(TypedDict):
+    """Response from running the agent."""
+    response: str
+    tool_summary: ToolCallSummary | None
+
+
+# Log file for agent/classifier
+AGENT_LOG_FILE = Path(__file__).parent / "agent.log"
+
+
+def _log_agent(message: str):
+    """Write to agent log file (no truncation)."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    log_line = f"[{timestamp}] {message}"
+    print(log_line)
+    with open(AGENT_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(log_line + "\n")
 
 
 # Intent types
@@ -35,18 +59,10 @@ Tu peux aussi :
 - Visiter mon site : https://luciformresearch.com
 """.strip()
 
-# Off-topic response
-OFF_TOPIC_RESPONSE = """
-Je suis là pour parler de mon travail et mes projets !
-
-Tu peux me poser des questions sur :
-- **RagForge** - Mon framework RAG avec Neo4j
-- **CodeParsers** - Mon parser multi-langage
-- **Mon parcours** - 42 Paris, dev 3D/jeux, IA
-- **Comment me contacter**
-
-Qu'est-ce qui t'intéresse ?
-""".strip()
+# Off-topic guidance (included in system prompt context)
+OFF_TOPIC_GUIDANCE = """
+Si la question est hors-sujet (pas liée à mon travail/projets), redirige poliment vers mes domaines d'expertise.
+"""
 
 
 # Agent state with intent
@@ -66,6 +82,7 @@ def create_agent():
         api_key=settings.anthropic_api_key,
         temperature=0,
         max_tokens=50,
+        max_retries=3,  # Built-in retry for rate limits
     )
 
     # LLM for responses (with tools)
@@ -74,6 +91,7 @@ def create_agent():
         api_key=settings.anthropic_api_key,
         temperature=settings.temperature,
         max_tokens=4096,
+        max_retries=3,  # Built-in retry for rate limits
     ).bind_tools(ALL_TOOLS)
 
     # LLM for responses (without tools - faster for simple responses)
@@ -82,29 +100,57 @@ def create_agent():
         api_key=settings.anthropic_api_key,
         temperature=settings.temperature,
         max_tokens=2048,
+        max_retries=3,  # Built-in retry for rate limits
     )
 
     # Classifier node
     def classify_intent(state: AgentState) -> dict:
-        """Classify the user's intent."""
+        """Classify the user's intent with conversation context."""
         messages = state["messages"]
-        # Find the last human message
+        conversation_id = state.get("conversation_id", "")
+
+        # Find the last human message and previous assistant message for context
         user_message = ""
+        last_assistant_message = ""
+
         for msg in reversed(messages):
-            if isinstance(msg, HumanMessage):
+            if isinstance(msg, HumanMessage) and not user_message:
                 user_message = msg.content
+            elif isinstance(msg, AIMessage) and not last_assistant_message:
+                # Get a snippet of the last assistant message for context
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                last_assistant_message = content[:300] if len(content) > 300 else content
+            if user_message and last_assistant_message:
                 break
 
+        # Build context-aware classification prompt
+        # Note: Tool summaries are now included in conversation_context from community-docs API
+        context_section = ""
+        if last_assistant_message:
+            context_section = f"""
+Previous assistant message (for context): "{last_assistant_message}"
+"""
+
         classification_prompt = f"""Classify this message into ONE of these categories:
-- TECHNIQUE: Questions about projects, code, technologies, implementation details
+- TECHNIQUE: Questions about projects, code, technologies, implementation details, OR follow-up/confirmation to technical discussions (like "oui", "ok", "continue")
 - PERSONNEL: Questions about background, experience, motivations, personality
 - CODE: Requests to see specific code examples or implementations
 - CONTACT: Questions about how to contact, email, social media, website
-- OFF_TOPIC: Anything unrelated to CV, work, or projects
-
-Message: "{user_message}"
+- OFF_TOPIC: Anything clearly unrelated to CV, work, or projects
+{context_section}
+User message: "{user_message}"
 
 Reply with ONLY the category name (TECHNIQUE, PERSONNEL, CODE, CONTACT, or OFF_TOPIC):"""
+
+        # Log the full classifier prompt
+        _log_agent(f"\n{'='*80}")
+        _log_agent(f"CLASSIFIER - Conversation: {conversation_id}")
+        _log_agent(f"{'='*80}")
+        _log_agent(f"USER MESSAGE: {user_message}")
+        _log_agent(f"LAST ASSISTANT: {last_assistant_message}")
+        _log_agent(f"{'-'*80}")
+        _log_agent(f"FULL CLASSIFICATION PROMPT:\n{classification_prompt}")
+        _log_agent(f"{'-'*80}")
 
         response = classifier_llm.invoke([HumanMessage(content=classification_prompt)])
         intent_text = response.content.strip().upper()
@@ -121,7 +167,10 @@ Reply with ONLY the category name (TECHNIQUE, PERSONNEL, CODE, CONTACT, or OFF_T
         else:
             intent = "OFF_TOPIC"
 
-        print(f"[Agent] Intent classified: {intent}")
+        _log_agent(f"CLASSIFIER RESPONSE: {intent_text}")
+        _log_agent(f"PARSED INTENT: {intent}")
+        _log_agent(f"{'='*80}\n")
+
         return {"intent": intent}
 
     # Route based on intent
@@ -156,10 +205,12 @@ Reply with ONLY the category name (TECHNIQUE, PERSONNEL, CODE, CONTACT, or OFF_T
         """Return contact information."""
         return {"messages": [AIMessage(content=CONTACT_INFO)]}
 
-    # Off-topic response
+    # Off-topic response (now uses LLM for context-aware redirection)
     def off_topic_response(state: AgentState) -> dict:
-        """Redirect off-topic questions."""
-        return {"messages": [AIMessage(content=OFF_TOPIC_RESPONSE)]}
+        """Redirect off-topic questions with context awareness."""
+        messages = state["messages"]
+        response = simple_llm.invoke(messages)
+        return {"messages": [response]}
 
     # Should continue with tools?
     def should_continue(state: AgentState) -> str:
@@ -235,9 +286,9 @@ async def run_agent(
     message: str,
     conversation_id: str,
     conversation_context: str | None = None
-) -> str:
+) -> AgentResponse:
     """
-    Run the agent with a message and return the response.
+    Run the agent with a message and return the response with tool summary.
 
     Args:
         message: The user's message
@@ -245,7 +296,7 @@ async def run_agent(
         conversation_context: Optional previous conversation context
 
     Returns:
-        The agent's response as a string
+        AgentResponse with response text and optional tool_summary
     """
     agent = get_agent()
 
@@ -262,14 +313,32 @@ async def run_agent(
         "intent": None,
     }
 
-    # Run the agent
+    # Run the agent (retry logic is built into ChatAnthropic with max_retries)
     config = {"recursion_limit": settings.max_iterations * 2}
 
     try:
         result = await agent.ainvoke(initial_state, config=config)
 
-        # Extract the final AI message
+        # Extract messages
         messages = result.get("messages", [])
+
+        # Extract tool calls from messages for summarization
+        tool_calls = []
+        for msg in messages:
+            if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tool_calls.append({
+                        "name": tc.get("name", "unknown"),
+                        "args": tc.get("args", {}),
+                        "result": ""  # Will be filled from ToolMessage
+                    })
+            elif isinstance(msg, ToolMessage):
+                # Match tool result with the corresponding call
+                if tool_calls and not tool_calls[-1]["result"]:
+                    tool_calls[-1]["result"] = str(msg.content)
+
+        # Extract the final AI message
+        response_text = ""
         for msg in reversed(messages):
             if isinstance(msg, AIMessage) and msg.content:
                 # Return content, handling potential list format
@@ -281,13 +350,40 @@ async def run_agent(
                             text_parts.append(block.get("text", ""))
                         elif isinstance(block, str):
                             text_parts.append(block)
-                    return "\n".join(text_parts)
-                return msg.content
+                    response_text = "\n".join(text_parts)
+                else:
+                    response_text = msg.content
+                break
 
-        return "Je n'ai pas pu generer de reponse."
+        if not response_text:
+            response_text = "Je n'ai pas pu generer de reponse."
+
+        # Generate tool summary if tools were called
+        tool_summary = None
+        if tool_calls:
+            _log_agent(f"\n{'='*80}")
+            _log_agent(f"GENERATING SUMMARY (non-streaming) - {len(tool_calls)} tool call(s)")
+            _log_agent(f"Conversation: {conversation_id}")
+            _log_agent(f"{'='*80}")
+
+            tool_summary = summarize_tool_calls(message, tool_calls, response_text)
+            if tool_summary:
+                _log_agent(f"SUMMARY GENERATED:")
+                _log_agent(f"  key_findings: {tool_summary['key_findings']}")
+                _log_agent(f"  assistant_action: {tool_summary['assistant_action']}")
+            _log_agent(f"{'='*80}\n")
+
+        return {
+            "response": response_text,
+            "tool_summary": tool_summary
+        }
 
     except Exception as e:
-        return f"Erreur lors de l'execution de l'agent: {str(e)}"
+        _log_agent(f"❌ Agent error: {str(e)}")
+        return {
+            "response": f"Erreur lors de l'execution de l'agent: {str(e)}",
+            "tool_summary": None
+        }
 
 
 async def run_agent_streaming(
@@ -299,6 +395,7 @@ async def run_agent_streaming(
     Run the agent with streaming output.
 
     Yields chunks of the response as they are generated.
+    Also captures tool calls and generates summaries.
     """
     agent = get_agent()
 
@@ -316,6 +413,11 @@ async def run_agent_streaming(
     }
 
     config = {"recursion_limit": settings.max_iterations * 2}
+
+    # Track tool calls for summarization
+    tool_calls = []
+    current_tool = None
+    full_response = ""
 
     try:
         async for event in agent.astream_events(initial_state, config=config, version="v2"):
@@ -331,22 +433,54 @@ async def run_agent_streaming(
                         if isinstance(content, list):
                             for block in content:
                                 if isinstance(block, dict) and block.get("type") == "text":
-                                    yield {"type": "token", "content": block.get("text", "")}
+                                    text = block.get("text", "")
+                                    full_response += text
+                                    yield {"type": "token", "content": text}
                                 elif isinstance(block, str):
+                                    full_response += block
                                     yield {"type": "token", "content": block}
                         else:
+                            full_response += content
                             yield {"type": "token", "content": content}
 
             elif kind == "on_tool_start":
                 # Tool is starting
                 tool_name = event.get("name", "unknown")
+                tool_input = event.get("data", {}).get("input", {})
+                current_tool = {"name": tool_name, "args": tool_input}
                 yield {"type": "tool_start", "name": tool_name}
 
             elif kind == "on_tool_end":
                 # Tool finished
                 tool_name = event.get("name", "unknown")
                 output = event.get("data", {}).get("output", "")
+                if current_tool:
+                    current_tool["result"] = str(output)
+                    tool_calls.append(current_tool)
+                    current_tool = None
                 yield {"type": "tool_end", "name": tool_name, "output": str(output)[:500]}
+
+        # Generate and yield summary if tools were called
+        if tool_calls:
+            _log_agent(f"\n{'='*80}")
+            _log_agent(f"GENERATING SUMMARY - {len(tool_calls)} tool call(s)")
+            _log_agent(f"Conversation: {conversation_id}")
+            _log_agent(f"{'='*80}")
+
+            summary = summarize_tool_calls(message, tool_calls, full_response)
+            if summary:
+                _log_agent(f"SUMMARY GENERATED:")
+                _log_agent(f"  key_findings: {summary['key_findings']}")
+                _log_agent(f"  assistant_action: {summary['assistant_action']}")
+                # Yield summary event for main.py to store via API
+                yield {
+                    "type": "tool_summary",
+                    "user_question": summary["user_question"],
+                    "tools_used": summary["tools_used"],
+                    "key_findings": summary["key_findings"],
+                    "assistant_action": summary["assistant_action"],
+                }
+            _log_agent(f"{'='*80}\n")
 
     except Exception as e:
         yield {"type": "error", "content": str(e)}

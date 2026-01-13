@@ -258,6 +258,10 @@ export class Neo4jClient {
       "CREATE INDEX file_projectId IF NOT EXISTS FOR (n:File) ON (n.projectId)",
       "CREATE INDEX markdowndocument_projectId IF NOT EXISTS FOR (n:MarkdownDocument) ON (n.projectId)",
       "CREATE INDEX markdownsection_projectId IF NOT EXISTS FOR (n:MarkdownSection) ON (n.projectId)",
+
+      // Unified fulltext index for BM25 search on all content nodes
+      // Searches on _name, _content, _description fields extracted by IncrementalIngestionManager
+      `CREATE FULLTEXT INDEX unified_fulltext IF NOT EXISTS FOR (n:Scope|File|DataFile|DocumentFile|PDFDocument|WordDocument|SpreadsheetDocument|MarkdownDocument|MarkdownSection|MediaFile|ImageFile|ThreeDFile|WebPage|CodeBlock|VueSFC|SvelteComponent|Stylesheet|GenericFile|PackageJson|DataSection|WebDocument) ON EACH [n._name, n._content, n._description]`,
     ];
 
     const constraints = [

@@ -995,6 +995,8 @@ export class CommunityAPIServer {
         format?: "json" | "markdown" | "compact";
         includeSource?: boolean;
         maxSourceResults?: number;
+        // File path filtering
+        glob?: string;
       };
     }>("/search", async (request, reply) => {
       const {
@@ -1016,6 +1018,8 @@ export class CommunityAPIServer {
         format,
         includeSource,
         maxSourceResults,
+        // File path filtering
+        glob,
       } = request.body || {};
 
       if (!query) {
@@ -1049,6 +1053,8 @@ export class CommunityAPIServer {
           embeddingType,
           limit,
           minScore,
+          // File path filtering
+          glob,
           // Post-processing options
           boostKeywords,
           boostWeight,
@@ -1114,6 +1120,77 @@ export class CommunityAPIServer {
         };
       } catch (err: any) {
         logger.error(`Search failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // =========================================================================
+    // Grep Search (regex pattern matching on indexed content)
+    // =========================================================================
+    this.server.post<{
+      Body: {
+        pattern: string;
+        ignoreCase?: boolean;
+        glob?: string;
+        limit?: number;
+        contextLines?: number;
+        filters?: SearchFilters;
+      };
+    }>("/grep", async (request, reply) => {
+      const {
+        pattern,
+        ignoreCase = false,
+        glob,
+        limit = 100,
+        contextLines = 0,
+        filters = {},
+      } = request.body || {};
+
+      if (!pattern) {
+        reply.status(400);
+        return { success: false, error: "Missing pattern" };
+      }
+
+      if (!this.orchestrator) {
+        reply.status(503);
+        return { success: false, error: "Orchestrator not available" };
+      }
+
+      logger.info(`Grep: "${pattern}" (glob: ${glob || '*'}, ignoreCase: ${ignoreCase})`);
+
+      try {
+        const result = await this.orchestrator.grep({
+          pattern,
+          ignoreCase,
+          glob,
+          limit,
+          contextLines,
+          categorySlug: filters.categorySlug,
+          userId: filters.userId,
+          documentId: filters.documentId,
+        });
+
+        return {
+          success: true,
+          pattern,
+          results: result.results.map(r => ({
+            filePath: r.filePath,
+            matches: r.matches,
+            totalLines: r.totalLines,
+            node: {
+              name: r.node.name || r.node._name,
+              type: r.node.type,
+              labels: r.node.labels,
+              startLine: r.node.startLine,
+              endLine: r.node.endLine,
+            },
+          })),
+          totalMatches: result.totalMatches,
+          filesMatched: result.filesMatched,
+        };
+      } catch (err: any) {
+        logger.error(`Grep failed: ${err.message}`);
         reply.status(500);
         return { success: false, error: err.message };
       }

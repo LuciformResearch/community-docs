@@ -9,6 +9,7 @@ import json
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 from collections import defaultdict
 
@@ -25,8 +26,82 @@ from .memory import (
     add_message,
     get_conversation_context,
     get_messages,
+    add_tool_summary,
 )
 from .tools import cleanup as cleanup_tools
+
+
+# Conversation log file
+CONVERSATION_LOG = Path(__file__).parent / "conversation.log"
+
+
+def _log_write(message: str):
+    """Write to conversation log with flush for real-time."""
+    with open(CONVERSATION_LOG, "a", encoding="utf-8") as f:
+        f.write(message)
+        f.flush()
+
+
+def log_conversation_start(visitor_id: str, conversation_id: str, mode: str, user_message: str):
+    """Log the start of a conversation turn (real-time)."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    _log_write(f"\n{'='*80}\n")
+    _log_write(f"[{timestamp}] CONVERSATION - {mode.upper()}\n")
+    _log_write(f"{'='*80}\n")
+    _log_write(f"Visitor: {visitor_id}\n")
+    _log_write(f"Conversation: {conversation_id}\n")
+    _log_write(f"{'-'*80}\n")
+    _log_write(f"USER MESSAGE:\n{user_message}\n")
+    _log_write(f"{'-'*80}\n")
+    _log_write(f"AGENT RESPONSE:\n")
+
+
+def log_token(token: str):
+    """Log a single token (real-time streaming)."""
+    _log_write(token)
+
+
+def log_tool_call(tool_name: str, event: str):
+    """Log a tool call event (start/end)."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    _log_write(f"\n[{timestamp}] 🔧 TOOL {event.upper()}: {tool_name}\n")
+
+
+def log_conversation_end():
+    """Log the end of a conversation turn."""
+    _log_write(f"\n{'='*80}\n\n")
+
+
+def log_conversation(
+    visitor_id: str,
+    conversation_id: str,
+    mode: str,
+    user_message: str,
+    full_response: str,
+    reasoning_steps: list[str] | None = None,
+    tool_calls: list[dict] | None = None,
+):
+    """Log complete conversation turn to file (for non-streaming mode)."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+    with open(CONVERSATION_LOG, "a", encoding="utf-8") as f:
+        f.write(f"\n{'='*80}\n")
+        f.write(f"[{timestamp}] CONVERSATION - {mode.upper()}\n")
+        f.write(f"{'='*80}\n")
+        f.write(f"Visitor: {visitor_id}\n")
+        f.write(f"Conversation: {conversation_id}\n")
+        f.write(f"{'-'*80}\n")
+        f.write(f"USER MESSAGE:\n{user_message}\n")
+        f.write(f"{'-'*80}\n")
+
+        if tool_calls:
+            f.write(f"TOOL CALLS ({len(tool_calls)}):\n")
+            for tc in tool_calls:
+                f.write(f"  - {tc.get('name', 'unknown')}\n")
+            f.write(f"{'-'*80}\n")
+
+        f.write(f"RESPONSE:\n{full_response}\n")
+        f.write(f"{'='*80}\n\n")
 
 
 # Rate limiting storage
@@ -240,7 +315,9 @@ async def chat(request: Request, body: ChatRequest):
     else:
         # Non-streaming response
         try:
-            response = await run_agent(body.message, conversation_id, context)
+            result = await run_agent(body.message, conversation_id, context)
+            response = result["response"]
+            tool_summary = result.get("tool_summary")
 
             # Store assistant message
             try:
@@ -248,7 +325,34 @@ async def chat(request: Request, body: ChatRequest):
             except Exception as e:
                 print(f"[Lucie Agent] Failed to store response: {e}")
 
+            # Store tool summary if generated
+            tool_calls = []
+            if tool_summary:
+                tool_calls = [{"name": t} for t in tool_summary.get("tools_used", [])]
+                try:
+                    await add_tool_summary(
+                        http_client,
+                        visitor_id,
+                        tool_summary.get("user_question", ""),
+                        tool_summary.get("tools_used", []),
+                        tool_summary.get("key_findings", ""),
+                        tool_summary.get("assistant_action", "")
+                    )
+                    print(f"[Lucie Agent] [{visitor_id}] Tool summary stored (non-streaming)")
+                except Exception as e:
+                    print(f"[Lucie Agent] Failed to store tool summary: {e}")
+
             print(f"[Lucie Agent] [{visitor_id}] Assistant: {response[:100]}...")
+
+            # Log complete conversation
+            log_conversation(
+                visitor_id=visitor_id,
+                conversation_id=conversation_id,
+                mode="non-streaming",
+                user_message=body.message,
+                full_response=response,
+                tool_calls=tool_calls if tool_calls else None,
+            )
 
             return ChatResponse(
                 success=True,
@@ -268,11 +372,14 @@ async def chat(request: Request, body: ChatRequest):
 
 
 async def stream_response(message: str, visitor_id: str, conversation_id: str, context: str):
-    """Generate SSE stream for chat response."""
+    """Generate SSE stream for chat response with real-time logging."""
     full_response = ""
 
     # Send start event with conversation ID
     yield f"event: start\ndata: {json.dumps({'conversationId': conversation_id, 'visitorId': visitor_id})}\n\n"
+
+    # Start real-time logging
+    log_conversation_start(visitor_id, conversation_id, "streaming", message)
 
     try:
         async for event in run_agent_streaming(message, conversation_id, context):
@@ -281,16 +388,33 @@ async def stream_response(message: str, visitor_id: str, conversation_id: str, c
             if event_type == "token":
                 content = event.get("content", "")
                 full_response += content
+                log_token(content)  # Real-time token logging
                 yield f"event: token\ndata: {json.dumps({'content': content})}\n\n"
 
             elif event_type == "tool_start":
                 tool_name = event.get("name", "unknown")
+                log_tool_call(tool_name, "start")  # Real-time tool logging
                 yield f"event: tool_start\ndata: {json.dumps({'name': tool_name})}\n\n"
 
             elif event_type == "tool_end":
                 tool_name = event.get("name", "unknown")
-                # Don't send full output to client (too large), just notify
+                log_tool_call(tool_name, "end")  # Real-time tool logging
                 yield f"event: tool_end\ndata: {json.dumps({'name': tool_name})}\n\n"
+
+            elif event_type == "tool_summary":
+                # Store tool summary via API
+                try:
+                    await add_tool_summary(
+                        http_client,
+                        visitor_id,
+                        event.get("user_question", ""),
+                        event.get("tools_used", []),
+                        event.get("key_findings", ""),
+                        event.get("assistant_action", "")
+                    )
+                    print(f"[Lucie Agent] [{visitor_id}] Tool summary stored")
+                except Exception as e:
+                    print(f"[Lucie Agent] Failed to store tool summary: {e}")
 
             elif event_type == "error":
                 error = event.get("content", "Unknown error")
@@ -304,11 +428,15 @@ async def stream_response(message: str, visitor_id: str, conversation_id: str, c
                 print(f"[Lucie Agent] Failed to store response: {e}")
             print(f"[Lucie Agent] [{visitor_id}] Assistant: {full_response[:100]}...")
 
+        # End real-time logging
+        log_conversation_end()
+
         # Send done event
         yield f"event: done\ndata: {json.dumps({'conversationId': conversation_id})}\n\n"
 
     except Exception as e:
         print(f"[Lucie Agent] Stream error: {e}")
+        log_conversation_end()
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
 
 

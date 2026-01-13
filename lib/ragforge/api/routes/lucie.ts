@@ -30,9 +30,19 @@ interface LucieSummary {
   createdAt: string;
 }
 
+interface LucieToolSummary {
+  id: string;
+  userQuestion: string;
+  toolsUsed: string[];
+  keyFindings: string;
+  assistantAction: string;
+  createdAt: string;
+}
+
 interface ConversationContext {
   conversationId: string;
   summaries: LucieSummary[];
+  toolSummaries: LucieToolSummary[];
   recentMessages: LucieMessage[];
   totalMessages: number;
 }
@@ -43,6 +53,7 @@ interface ConversationContext {
 
 const SUMMARIZE_AFTER_MESSAGES = 10; // Create L1 summary after this many messages
 const RECENT_MESSAGES_COUNT = 5; // Keep this many recent messages in context
+const TOOL_SUMMARIES_COUNT = 5; // Keep this many recent tool summaries
 const L1_SUMMARY_MODEL = "claude-sonnet-4-20250514";
 
 // ============================================================================
@@ -139,6 +150,71 @@ class LucieConversationService {
   }
 
   /**
+   * Add a tool call summary to the conversation
+   */
+  async addToolSummary(
+    conversationId: string,
+    summary: {
+      userQuestion: string;
+      toolsUsed: string[];
+      keyFindings: string;
+      assistantAction: string;
+    }
+  ): Promise<string> {
+    const summaryId = `tool-summary-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    await this.neo4j.run(
+      `MATCH (c:LucieConversation {id: $conversationId})
+       CREATE (ts:LucieToolSummary {
+         id: $summaryId,
+         conversationId: $conversationId,
+         userQuestion: $userQuestion,
+         toolsUsed: $toolsUsed,
+         keyFindings: $keyFindings,
+         assistantAction: $assistantAction,
+         createdAt: datetime()
+       })
+       CREATE (c)-[:HAS_TOOL_SUMMARY]->(ts)`,
+      {
+        conversationId,
+        summaryId,
+        userQuestion: summary.userQuestion,
+        toolsUsed: summary.toolsUsed,
+        keyFindings: summary.keyFindings,
+        assistantAction: summary.assistantAction,
+      }
+    );
+
+    console.log(`[Lucie] Added tool summary: ${summaryId}`);
+    return summaryId;
+  }
+
+  /**
+   * Get recent tool summaries for a conversation
+   */
+  async getToolSummaries(conversationId: string): Promise<LucieToolSummary[]> {
+    const result = await this.neo4j.run(
+      `MATCH (c:LucieConversation {id: $conversationId})-[:HAS_TOOL_SUMMARY]->(ts:LucieToolSummary)
+       RETURN ts.id AS id, ts.userQuestion AS userQuestion, ts.toolsUsed AS toolsUsed,
+              ts.keyFindings AS keyFindings, ts.assistantAction AS assistantAction,
+              ts.createdAt AS createdAt
+       ORDER BY ts.createdAt DESC
+       LIMIT toInteger($limit)`,
+      { conversationId, limit: neo4jInt(TOOL_SUMMARIES_COUNT) }
+    );
+
+    // Return in chronological order (oldest first)
+    return result.records.map((r) => ({
+      id: r.get("id"),
+      userQuestion: r.get("userQuestion"),
+      toolsUsed: r.get("toolsUsed") || [],
+      keyFindings: r.get("keyFindings"),
+      assistantAction: r.get("assistantAction"),
+      createdAt: r.get("createdAt")?.toString() || "",
+    })).reverse();
+  }
+
+  /**
    * Get conversation context (summaries + recent messages)
    */
   async getContext(conversationId: string): Promise<ConversationContext> {
@@ -194,9 +270,13 @@ class LucieConversationService {
     );
     const totalMessages = this.extractInt(countResult.records[0]?.get("count")) || 0;
 
+    // Get tool summaries
+    const toolSummaries = await this.getToolSummaries(conversationId);
+
     return {
       conversationId,
       summaries,
+      toolSummaries,
       recentMessages,
       totalMessages,
     };
@@ -316,6 +396,18 @@ class LucieConversationService {
       parts.push("## Previous Conversation Summary\n");
       for (const summary of context.summaries) {
         parts.push(`[Turns ${summary.turnStart}-${summary.turnEnd}]: ${summary.content}\n`);
+      }
+    }
+
+    // Add tool summaries
+    if (context.toolSummaries.length > 0) {
+      parts.push("\n## Recent Tool Call History\n");
+      for (let i = 0; i < context.toolSummaries.length; i++) {
+        const ts = context.toolSummaries[i];
+        parts.push(`${i + 1}. User asked: "${ts.userQuestion}"\n`);
+        parts.push(`   Tools: ${ts.toolsUsed.join(", ")}\n`);
+        parts.push(`   Found: ${ts.keyFindings}\n`);
+        parts.push(`   Action: ${ts.assistantAction}\n`);
       }
     }
 
@@ -558,6 +650,76 @@ export function registerLucieRoutes(
       };
     } catch (error: any) {
       console.error(`[Lucie] Failed to get history: ${error.message}`);
+      reply.status(500);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // =========================================================================
+  // POST /lucie/tool-summary - Add tool call summary
+  // =========================================================================
+  server.post<{
+    Body: {
+      visitorId: string;
+      userQuestion: string;
+      toolsUsed: string[];
+      keyFindings: string;
+      assistantAction: string;
+    };
+  }>("/lucie/tool-summary", async (request, reply) => {
+    const { visitorId, userQuestion, toolsUsed, keyFindings, assistantAction } = request.body || {};
+
+    if (!visitorId || !userQuestion || !toolsUsed || !keyFindings || !assistantAction) {
+      reply.status(400);
+      return { success: false, error: "visitorId, userQuestion, toolsUsed, keyFindings, and assistantAction are required" };
+    }
+
+    try {
+      const conversationId = `lucie-${visitorId}`;
+      const summaryId = await service.addToolSummary(conversationId, {
+        userQuestion,
+        toolsUsed,
+        keyFindings,
+        assistantAction,
+      });
+
+      return {
+        success: true,
+        conversationId,
+        summaryId,
+      };
+    } catch (error: any) {
+      console.error(`[Lucie] Failed to add tool summary: ${error.message}`);
+      reply.status(500);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // =========================================================================
+  // GET /lucie/tool-summaries/:visitorId - Get tool summaries
+  // =========================================================================
+  server.get<{
+    Params: { visitorId: string };
+  }>("/lucie/tool-summaries/:visitorId", async (request, reply) => {
+    const { visitorId } = request.params;
+
+    if (!visitorId) {
+      reply.status(400);
+      return { success: false, error: "visitorId is required" };
+    }
+
+    try {
+      const conversationId = `lucie-${visitorId}`;
+      const toolSummaries = await service.getToolSummaries(conversationId);
+
+      return {
+        success: true,
+        conversationId,
+        toolSummaries,
+        count: toolSummaries.length,
+      };
+    } catch (error: any) {
+      console.error(`[Lucie] Failed to get tool summaries: ${error.message}`);
       reply.status(500);
       return { success: false, error: error.message };
     }

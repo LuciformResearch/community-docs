@@ -39,6 +39,9 @@ import {
   type SearchFilter,
   type ServiceSearchResult,
   type ServiceSearchResultSet,
+  type GrepOptions,
+  type GrepResult,
+  type GrepResultSet,
   // Post-processing types
   type ExplorationGraph,
   type SummaryResult,
@@ -124,6 +127,11 @@ export interface CommunitySearchOptions {
   limit?: number;
   /** Minimum score threshold */
   minScore?: number;
+
+  // === File path filtering ===
+
+  /** Glob pattern to filter results by file path (e.g. match .ts files) */
+  glob?: string;
 
   // === Post-processing options (from @ragforge/core) ===
 
@@ -1706,6 +1714,7 @@ export class CommunityOrchestratorAdapter {
       limit: searchLimit,
       minScore: options.minScore ?? 0.3,
       filters,
+      glob: options.glob,
     });
 
     // Map to community format with snippets
@@ -1969,6 +1978,81 @@ export class CommunityOrchestratorAdapter {
       summary,
       formattedOutput,
     };
+  }
+
+  /**
+   * Grep search - regex pattern matching on indexed content
+   *
+   * Uses SearchService.grep() to search _content field with regex patterns.
+   * Supports glob filtering, context lines, and community-specific filters.
+   *
+   * @example
+   * ```typescript
+   * const results = await orchestrator.grep({
+   *   pattern: 'async function.*Handler',
+   *   glob: '**\/*.ts',
+   *   ignoreCase: true,
+   *   contextLines: 2,
+   *   categorySlug: 'ragforge',
+   * });
+   * ```
+   */
+  async grep(options: {
+    pattern: string;
+    ignoreCase?: boolean;
+    glob?: string;
+    limit?: number;
+    contextLines?: number;
+    // Community-specific filters
+    categorySlug?: string;
+    userId?: string;
+    documentId?: string;
+  }): Promise<GrepResultSet> {
+    await this.initialize();
+
+    if (!this.searchService) {
+      throw new Error("SearchService not initialized");
+    }
+
+    // Build community-specific filters
+    const filters: SearchFilter[] = [];
+
+    if (options.categorySlug) {
+      filters.push({
+        property: "categorySlug",
+        operator: "eq",
+        value: options.categorySlug,
+      });
+    }
+
+    if (options.userId) {
+      filters.push({
+        property: "userId",
+        operator: "eq",
+        value: options.userId,
+      });
+    }
+
+    if (options.documentId) {
+      filters.push({
+        property: "documentId",
+        operator: "eq",
+        value: options.documentId,
+      });
+    }
+
+    logger.info(
+      `[CommunityOrchestrator] Grep: "${options.pattern}" (glob: ${options.glob || '*'}, filters: ${filters.length})`
+    );
+
+    return this.searchService.grep({
+      pattern: options.pattern,
+      ignoreCase: options.ignoreCase,
+      glob: options.glob,
+      limit: options.limit,
+      contextLines: options.contextLines,
+      filters,
+    });
   }
 
   /**
