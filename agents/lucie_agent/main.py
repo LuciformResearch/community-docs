@@ -221,6 +221,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Register Twilio WhatsApp webhook routes
+try:
+    from .twilio_webhook import register_twilio_routes
+    register_twilio_routes(app)
+    print("[Lucie Agent] Twilio WhatsApp webhook routes registered")
+except ImportError as e:
+    print(f"[Lucie Agent] Twilio webhook not available: {e}")
+
 
 # Request/Response models
 class ChatRequest(BaseModel):

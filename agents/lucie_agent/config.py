@@ -61,6 +61,21 @@ class Settings(BaseSettings):
         env="RATE_LIMIT_PER_MINUTE"
     )
 
+    # Twilio WhatsApp
+    twilio_account_sid: str = Field(
+        default="",
+        env="TWILIO_ACCOUNT_SID"
+    )
+    twilio_auth_token: str = Field(
+        default="",
+        env="TWILIO_AUTH_TOKEN"
+    )
+    twilio_whatsapp_number: str = Field(
+        default="",
+        env="TWILIO_WHATSAPP_NUMBER",
+        description="Twilio WhatsApp number (e.g., +14155238886 for sandbox)"
+    )
+
     class Config:
         env_file = str(_CONFIG_DIR / ".env")
         env_file_encoding = "utf-8"

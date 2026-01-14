@@ -12,6 +12,10 @@ sse-starlette>=2.0.0
 # HTTP Client
 httpx>=0.28.0
 
+# Twilio WhatsApp
+twilio>=9.0.0
+python-multipart>=0.0.9  # Required for FastAPI Form()
+
 # Configuration
 python-dotenv>=1.0.0
 pydantic>=2.0.0

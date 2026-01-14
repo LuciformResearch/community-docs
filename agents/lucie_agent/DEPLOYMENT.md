@@ -216,6 +216,43 @@ docker restart community-docs-neo4j
 | Quota (visitor) | 15 req/jour |
 | Localhost | Illimité |
 
+## WhatsApp (Twilio Sandbox)
+
+L'agent peut répondre via WhatsApp en utilisant Twilio Sandbox (gratuit pour démos).
+
+### Configuration
+
+1. Créer un compte sur [Twilio Console](https://console.twilio.com/)
+2. Aller dans **Messaging > Try it out > Send a WhatsApp message**
+3. Noter le sandbox code (ex: "join example-word")
+4. Ajouter dans `.env`:
+
+```bash
+TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+TWILIO_WHATSAPP_NUMBER=+14155238886
+```
+
+### Configurer le Webhook
+
+Dans la console Twilio (Messaging > Settings > WhatsApp Sandbox Settings):
+
+- **When a message comes in**: `https://lucie-agent.luciformresearch.com/webhook/whatsapp`
+- **Method**: POST
+
+### Test
+
+1. Envoyer "join <code>" au `+1 415 523 8886` sur WhatsApp
+2. Une fois inscrit, envoyer n'importe quel message
+3. Lucie répond !
+
+### Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /webhook/whatsapp` | Reçoit les messages Twilio |
+| `GET /webhook/whatsapp/health` | Vérifie la config Twilio |
+
 ## Contact
 
 - **Email**: luciedefraiteur@luciformresearch.com
