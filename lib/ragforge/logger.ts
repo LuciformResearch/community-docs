@@ -312,3 +312,116 @@ export const LOG_FILES = {
 
 // Default logger instance for convenience imports
 export const logger = getAPILogger();
+
+// ============================================================================
+// CONSOLE INTERCEPTOR
+// ============================================================================
+
+// Store original console methods
+const originalConsole = {
+  log: console.log.bind(console),
+  info: console.info.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console),
+  debug: console.debug.bind(console),
+};
+
+let _consoleIntercepted = false;
+
+/**
+ * Write directly to log file (sync-ish via fire-and-forget)
+ */
+function writeToLogFile(logFile: string, line: string): void {
+  // Fire and forget - don't block console output
+  fs.appendFile(logFile, line + "\n").catch(() => {});
+}
+
+/**
+ * Intercept all console.* calls and redirect to log files.
+ * This captures ALL logs including those from third-party libraries
+ * that don't use our Logger class.
+ *
+ * Call this ONCE at the start of your application.
+ *
+ * @example
+ * ```ts
+ * import { interceptConsole } from "./logger";
+ * interceptConsole(); // Call at startup
+ * ```
+ */
+export function interceptConsole(): void {
+  if (_consoleIntercepted) {
+    return; // Already intercepted
+  }
+
+  // Ensure log directory exists (sync to avoid race conditions)
+  import("fs").then((fsSync) => {
+    try {
+      fsSync.mkdirSync(LOG_DIR, { recursive: true });
+    } catch {}
+  });
+
+  const formatLine = (level: string, args: any[]): string => {
+    const timestamp = getLocalTimestamp();
+    const levelStr = level.toUpperCase().padEnd(5);
+    const message = args.map(arg => {
+      if (typeof arg === "string") return arg;
+      if (arg instanceof Error) return `${arg.message}\n${arg.stack}`;
+      try {
+        return JSON.stringify(arg);
+      } catch {
+        return String(arg);
+      }
+    }).join(" ");
+    return `[${timestamp}] [${levelStr}] ${message}`;
+  };
+
+  console.log = (...args: any[]) => {
+    originalConsole.log(...args);
+    const line = formatLine("INFO", args);
+    writeToLogFile(API_LOG_FILE, line);
+  };
+
+  console.info = (...args: any[]) => {
+    originalConsole.info(...args);
+    const line = formatLine("INFO", args);
+    writeToLogFile(API_LOG_FILE, line);
+  };
+
+  console.warn = (...args: any[]) => {
+    originalConsole.warn(...args);
+    const line = formatLine("WARN", args);
+    writeToLogFile(API_LOG_FILE, line);
+  };
+
+  console.error = (...args: any[]) => {
+    originalConsole.error(...args);
+    const line = formatLine("ERROR", args);
+    writeToLogFile(API_LOG_FILE, line);
+    writeToLogFile(ERROR_LOG_FILE, line);
+  };
+
+  console.debug = (...args: any[]) => {
+    originalConsole.debug(...args);
+    const line = formatLine("DEBUG", args);
+    writeToLogFile(API_LOG_FILE, line);
+  };
+
+  _consoleIntercepted = true;
+  originalConsole.log(`[${getLocalTimestamp()}] [INFO ] Console interceptor enabled - logs redirected to ${LOG_DIR}`);
+}
+
+/**
+ * Restore original console methods (useful for testing)
+ */
+export function restoreConsole(): void {
+  if (!_consoleIntercepted) return;
+
+  console.log = originalConsole.log;
+  console.info = originalConsole.info;
+  console.warn = originalConsole.warn;
+  console.error = originalConsole.error;
+  console.debug = originalConsole.debug;
+
+  _consoleIntercepted = false;
+}

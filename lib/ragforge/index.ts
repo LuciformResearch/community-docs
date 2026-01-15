@@ -124,22 +124,6 @@ export type {
 } from "./entity-types";
 export { DEFAULT_ENRICHMENT_OPTIONS } from "./entity-types";
 
-// Enrichment Service (LLM-based entity/tag extraction)
-export {
-  EnrichmentService,
-  createEnrichmentService,
-  type NodeToEnrich,
-  type DocumentContext,
-} from "./enrichment-service";
-
-// Entity Resolution Service (cross-document deduplication)
-export {
-  EntityResolutionService,
-  createEntityResolutionService,
-  DEFAULT_RESOLUTION_OPTIONS,
-  type EntityResolutionOptions,
-} from "./entity-resolution-service";
-
 // Entity Embedding Service (embeddings for Entity/Tag nodes + hybrid search)
 export {
   EntityEmbeddingService,

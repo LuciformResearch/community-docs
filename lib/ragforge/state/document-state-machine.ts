@@ -426,10 +426,10 @@ export class DocumentStateMachine {
       MATCH (n {documentId: $documentId})
       WHERE (n:Scope OR n:MarkdownSection OR n:CodeBlock)
         AND n.${P.state} = 'linked'
-        AND (n.source IS NOT NULL OR n.textContent IS NOT NULL OR n.content IS NOT NULL)
+        AND n._content IS NOT NULL
       RETURN n.uuid AS uuid,
              labels(n)[0] AS label,
-             COALESCE(n.source, n.textContent, n.content) AS content
+             n._content AS content
       LIMIT $limit
       `,
       { documentId, limit }

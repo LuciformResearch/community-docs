@@ -31,6 +31,9 @@ import {
   // Parsers for binary files
   documentParser,
   mediaParser,
+  // Entity extraction (GLiNER)
+  EntityExtractionClient,
+  createEntityExtractionTransform,
   type OrchestratorDependencies,
   type FileChange,
   type IngestionStats,
@@ -51,15 +54,14 @@ import {
   // Document parse options
   type DocumentParseOptions,
   type MediaParseOptions,
+  // Entity extraction types
+  type EntityExtractionConfig,
 } from "@luciformresearch/ragforge";
 import type { Neo4jClient } from "./neo4j-client";
 import type { CommunityNodeMetadata } from "./types";
 import { getPipelineLogger } from "./logger";
 import type { EntityEmbeddingService, EntitySearchResult } from "./entity-embedding-service";
-import { createEnrichmentService, type EnrichmentService, type DocumentContext } from "./enrichment-service";
-import { EntityResolutionService, type EntityResolutionOptions } from "./entity-resolution-service";
 import type { Entity, ExtractedTag } from "./entity-types";
-import type { NodeToEnrich } from "./enrichment-service";
 
 const logger = getPipelineLogger();
 
@@ -82,6 +84,11 @@ export interface CommunityOrchestratorOptions {
   embeddingConfig?: EmbeddingProviderConfig;
   /** Enable verbose logging */
   verbose?: boolean;
+  /** Entity extraction config (GLiNER service) */
+  entityExtraction?: Partial<EntityExtractionConfig> & {
+    /** Enable entity extraction (default: false) */
+    enabled?: boolean;
+  };
 }
 
 /**
@@ -311,12 +318,8 @@ export interface UnifiedIngestionOptions {
   generateTitles?: boolean;
   /** Generate embeddings after ingestion (default: true) */
   generateEmbeddings?: boolean;
-  /** Extract entities and tags from document content and media descriptions (default: false) */
+  /** Extract entities using GLiNER (default: false) */
   extractEntities?: boolean;
-  /** EnrichmentService instance for entity extraction (required if extractEntities is true) */
-  enrichmentService?: import('./enrichment-service').EnrichmentService;
-  /** EntityResolutionService instance for deduplication (optional, uses default if extractEntities is true) */
-  entityResolutionService?: import('./entity-resolution-service').EntityResolutionService;
 }
 
 /**
@@ -338,17 +341,6 @@ export interface UnifiedIngestionResult {
     textNodes: number;
     binaryNodes: number;
     mediaNodes: number;
-  };
-  /** Entity extraction stats (if extractEntities was enabled) */
-  entityStats?: {
-    /** Number of entities extracted */
-    entitiesExtracted: number;
-    /** Number of tags extracted */
-    tagsExtracted: number;
-    /** Number of canonical entities created/updated */
-    canonicalEntitiesCreated: number;
-    /** Number of entity relationships created */
-    entityRelationshipsCreated: number;
   };
   /** Warnings from parsing */
   warnings?: string[];
@@ -373,6 +365,10 @@ export class CommunityOrchestratorAdapter {
   // Entity/Tag embedding service (for entity boost in search)
   private entityEmbeddingService: EntityEmbeddingService | null = null;
 
+  // Entity extraction client (GLiNER)
+  private entityExtractionClient: EntityExtractionClient | null = null;
+  private entityExtractionEnabled: boolean;
+
   // Current metadata for transformGraph hook
   private currentMetadata: CommunityNodeMetadata | null = null;
 
@@ -381,6 +377,13 @@ export class CommunityOrchestratorAdapter {
     this.embeddingConfig = options.embeddingConfig ?? null;
     this.verbose = options.verbose ?? false;
     this.sourceAdapter = new UniversalSourceAdapter();
+
+    // Entity extraction config
+    this.entityExtractionEnabled = options.entityExtraction?.enabled ?? false;
+    if (this.entityExtractionEnabled) {
+      this.entityExtractionClient = new EntityExtractionClient(options.entityExtraction);
+      logger.info(`[CommunityOrchestrator] Entity extraction enabled: ${options.entityExtraction?.serviceUrl ?? 'http://localhost:6971'}`);
+    }
   }
 
   /**
@@ -476,8 +479,8 @@ export class CommunityOrchestratorAdapter {
           }
         : undefined,
 
-      // Transform graph to inject community metadata
-      transformGraph: (graph) => {
+      // Transform graph to inject community metadata + entity extraction
+      transformGraph: async (graph) => {
         if (!this.currentMetadata) {
           return graph;
         }
@@ -532,6 +535,74 @@ export class CommunityOrchestratorAdapter {
             if (parsedFromMatch) {
               node.properties.parsedFrom = parsedFromMatch[1];
             }
+          }
+        }
+
+        // Entity extraction (if enabled)
+        if (this.entityExtractionEnabled && this.entityExtractionClient) {
+          try {
+            const isAvailable = await this.entityExtractionClient.isAvailable();
+            if (isAvailable) {
+              const nodesBefore = graph.nodes.length;
+
+              // Debug: check node types and content
+              const nodeTypes = graph.nodes.reduce((acc, n) => {
+                const label = n.labels[0] || 'unknown';
+                acc[label] = (acc[label] || 0) + 1;
+                return acc;
+              }, {} as Record<string, number>);
+
+              const nodesWithContent = graph.nodes.filter(n => n.properties._content).length;
+
+              logger.info(
+                `[CommunityOrchestrator] Starting entity extraction: ${nodesBefore} nodes, ` +
+                `${nodesWithContent} with extractable content, types: ${JSON.stringify(nodeTypes)}`
+              );
+
+              // Create embedding function for hybrid deduplication
+              const embedFunction = this.embeddingService
+                ? async (texts: string[]) => {
+                    return await this.embeddingService!.embedBatch(texts);
+                  }
+                : undefined;
+
+              const entityTransform = createEntityExtractionTransform({
+                ...this.entityExtractionClient.getConfig(),
+                projectId, // Pass projectId so Entity nodes get correct project assignment
+                verbose: this.verbose,
+                deduplication: {
+                  strategy: 'hybrid',
+                  fuzzyThreshold: 0.85,
+                  embeddingThreshold: 0.9,
+                },
+                embedFunction,
+              });
+              graph = await entityTransform(graph as any) as typeof graph;
+
+              // Count entity nodes and MENTIONS relationships
+              const entityNodes = graph.nodes.filter(n => n.labels.includes('Entity'));
+              const mentionsRels = graph.relationships.filter(r => r.type === 'MENTIONS');
+
+              logger.info(
+                `[CommunityOrchestrator] Entity extraction completed: ` +
+                `${entityNodes.length} Entity nodes, ${mentionsRels.length} MENTIONS relations, ` +
+                `total nodes: ${nodesBefore} → ${graph.nodes.length}`
+              );
+
+              if (entityNodes.length > 0) {
+                const entityTypes = entityNodes.reduce((acc, node) => {
+                  const type = node.properties.entityType || 'unknown';
+                  acc[type] = (acc[type] || 0) + 1;
+                  return acc;
+                }, {} as Record<string, number>);
+                logger.info(`[CommunityOrchestrator] Entity types: ${JSON.stringify(entityTypes)}`);
+              }
+            } else {
+              logger.warn("[CommunityOrchestrator] GLiNER service not available, skipping entity extraction");
+            }
+          } catch (error) {
+            logger.error("[CommunityOrchestrator] Entity extraction failed:", error);
+            // Continue without entity extraction
           }
         }
 
@@ -817,8 +888,6 @@ export class CommunityOrchestratorAdapter {
       generateTitles = true,
       generateEmbeddings = true,
       extractEntities = false,
-      enrichmentService,
-      entityResolutionService,
     } = options;
 
     const projectId = `doc-${documentId}`;
@@ -1047,6 +1116,86 @@ export class CommunityOrchestratorAdapter {
       node.properties.sourceType = 'community-upload';
     }
 
+    // Entity extraction (via transformGraph hook)
+    logger.info(`[UnifiedIngestion] Entity extraction check: enabled=${this.entityExtractionEnabled}, client=${!!this.entityExtractionClient}, nodes=${allNodes.length}`);
+    if (this.entityExtractionEnabled && this.entityExtractionClient && allNodes.length > 0) {
+      try {
+        logger.info(`[UnifiedIngestion] Running entity extraction on ${allNodes.length} nodes`);
+        const graph = { nodes: allNodes, relationships: allRelationships, metadata: { filesProcessed: files.length, nodesGenerated: allNodes.length } };
+
+        // Call the transformGraph hook manually (since ingestFiles doesn't go through orchestrator.ingest)
+        const isAvailable = await this.entityExtractionClient.isAvailable();
+        if (isAvailable) {
+          const nodesBefore = graph.nodes.length;
+
+          // Debug: check node types and content
+          const nodeTypes = graph.nodes.reduce((acc, n) => {
+            const label = n.labels[0] || 'unknown';
+            acc[label] = (acc[label] || 0) + 1;
+            return acc;
+          }, {} as Record<string, number>);
+
+          const nodesWithContent = graph.nodes.filter(n => n.properties._content).length;
+
+          logger.info(
+            `[UnifiedIngestion] Starting entity extraction: ${nodesBefore} nodes, ` +
+            `${nodesWithContent} with extractable content, types: ${JSON.stringify(nodeTypes)}`
+          );
+
+          // Create embedding function for hybrid deduplication
+          const embedFunction = this.embeddingService
+            ? async (texts: string[]) => {
+                return await this.embeddingService!.embedBatch(texts);
+              }
+            : undefined;
+
+          const entityTransform = createEntityExtractionTransform({
+            ...this.entityExtractionClient.getConfig(),
+            projectId, // Pass projectId so Entity nodes get correct project assignment
+            verbose: this.verbose,
+            deduplication: {
+              strategy: embedFunction ? 'hybrid' : 'fuzzy',
+              fuzzyThreshold: 0.85,
+              embeddingThreshold: 0.9,
+            },
+            embedFunction,
+          });
+
+          const transformedGraph = await entityTransform(graph as any);
+
+          // Count entity nodes and MENTIONS relationships
+          const entityNodes = transformedGraph.nodes.filter(n => n.labels.includes('Entity'));
+          const mentionsRels = transformedGraph.relationships.filter(r => r.type === 'MENTIONS');
+
+          logger.info(
+            `[UnifiedIngestion] Entity extraction completed: ` +
+            `${entityNodes.length} Entity nodes, ${mentionsRels.length} MENTIONS relations, ` +
+            `total nodes: ${nodesBefore} → ${transformedGraph.nodes.length}`
+          );
+
+          if (entityNodes.length > 0) {
+            const entityTypes = entityNodes.reduce((acc, node) => {
+              const type = node.properties.entityType || 'unknown';
+              acc[type] = (acc[type] || 0) + 1;
+              return acc;
+            }, {} as Record<string, number>);
+            logger.info(`[UnifiedIngestion] Entity types: ${JSON.stringify(entityTypes)}`);
+          }
+
+          // Update allNodes and allRelationships with transformed graph
+          allNodes.length = 0;
+          allNodes.push(...transformedGraph.nodes);
+          allRelationships.length = 0;
+          allRelationships.push(...transformedGraph.relationships);
+        } else {
+          logger.warn("[UnifiedIngestion] GLiNER service not available, skipping entity extraction");
+        }
+      } catch (error) {
+        logger.error("[UnifiedIngestion] Entity extraction failed:", error);
+        // Continue without entity extraction
+      }
+    }
+
     // Single batch ingest into Neo4j
     if (allNodes.length > 0) {
       logger.info(`[UnifiedIngestion] Ingesting ${allNodes.length} nodes, ${allRelationships.length} relationships`);
@@ -1072,189 +1221,19 @@ export class CommunityOrchestratorAdapter {
       }
     }
 
-    // Entity extraction for non-code content
-    let entityStats: UnifiedIngestionResult['entityStats'] | undefined;
-    if (extractEntities && enrichmentService && allNodes.length > 0) {
-      try {
-        logger.info(`[UnifiedIngestion] Extracting entities and tags...`);
-
-        // Collect nodes with enrichable content
-        // - MarkdownSection nodes (document sections)
-        // - MediaFile/ImageFile/ThreeDFile nodes with descriptions
-        const nodesToEnrich: NodeToEnrich[] = [];
-
-        for (const node of allNodes) {
-          const labels = node.labels;
-          const props = node.properties;
-
-          // Document sections have content
-          if (labels.includes('MarkdownSection') && props.content) {
-            nodesToEnrich.push({
-              uuid: props.uuid || node.id,
-              nodeType: 'MarkdownSection',
-              name: props.title as string || 'Untitled Section',
-              content: props.content as string,
-              filePath: props.sourcePath as string | undefined,
-            });
-          }
-          // Media files use their vision description as content
-          else if (
-            (labels.includes('MediaFile') || labels.includes('ImageFile') || labels.includes('ThreeDFile')) &&
-            props.description
-          ) {
-            const fullPath = props.file as string | undefined;
-            const fileName = fullPath ? fullPath.split('/').pop() : undefined;
-            nodesToEnrich.push({
-              uuid: props.uuid || node.id,
-              nodeType: labels[0], // ImageFile, ThreeDFile, or MediaFile
-              name: fileName || 'Media File',
-              content: props.description as string,
-              filePath: fullPath, // Full filename for entity extraction
-            });
-          }
-        }
-
-        if (nodesToEnrich.length > 0) {
-          logger.info(`[UnifiedIngestion] Enriching ${nodesToEnrich.length} nodes (sections + media descriptions)`);
-
-          // Build document context for enrichment
-          const docContext: DocumentContext = {
-            documentId,
-            projectId,
-            nodes: nodesToEnrich,
-          };
-
-          // Extract entities and tags
-          const enrichResult = await enrichmentService.enrichDocument(docContext);
-
-          logger.info(`[UnifiedIngestion] Extracted ${enrichResult.entities.length} entities, ${enrichResult.tags.length} tags`);
-
-          // Store entities and tags in Neo4j, linked to source nodes
-          let entitiesCreated = 0;
-          let tagsCreated = 0;
-          let entityRelsCreated = 0;
-
-          if (enrichResult.nodeEnrichments) {
-            for (const nodeEnrich of enrichResult.nodeEnrichments) {
-              // Create Entity nodes linked to source
-              if (nodeEnrich.entities && nodeEnrich.entities.length > 0) {
-                for (const entity of nodeEnrich.entities) {
-                  await this.neo4j.run(`
-                    CREATE (e:Entity {
-                      uuid: randomUUID(),
-                      name: $name,
-                      normalizedName: toLower($name),
-                      entityType: $type,
-                      confidence: $confidence,
-                      aliases: $aliases,
-                      projectId: $projectId,
-                      documentId: $documentId,
-                      sourceNodeId: $sourceNodeId,
-                      createdAt: datetime()
-                    })
-                    WITH e
-                    MATCH (source {uuid: $sourceNodeId})
-                    CREATE (source)-[:CONTAINS_ENTITY {confidence: $confidence}]->(e)
-                  `, {
-                    name: entity.name,
-                    type: entity.type,
-                    confidence: entity.confidence,
-                    aliases: entity.aliases || [],
-                    projectId,
-                    documentId,
-                    sourceNodeId: nodeEnrich.nodeId,
-                  });
-                  entitiesCreated++;
-                  entityRelsCreated++;
-                }
-              }
-
-              // Create Tag nodes linked to source
-              if (nodeEnrich.tags && nodeEnrich.tags.length > 0) {
-                for (const tag of nodeEnrich.tags) {
-                  // Compute normalizedName in JS to match the constraint key
-                  const normalizedName = tag.name.toLowerCase().replace(/\s+/g, '-');
-                  await this.neo4j.run(`
-                    MERGE (t:Tag {normalizedName: $normalizedName})
-                    ON CREATE SET t.uuid = randomUUID(), t.name = $name, t.category = $category,
-                                  t.createdAt = datetime()
-                    ON MATCH SET t.name = CASE WHEN t.name IS NULL THEN $name ELSE t.name END
-                    SET t.projectIds = CASE
-                      WHEN $projectId IN coalesce(t.projectIds, []) THEN t.projectIds
-                      ELSE coalesce(t.projectIds, []) + $projectId
-                    END,
-                    t.usageCount = coalesce(t.usageCount, 0) + 1
-                    WITH t
-                    MATCH (source {uuid: $sourceNodeId})
-                    MERGE (source)-[:HAS_TAG]->(t)
-                  `, {
-                    name: tag.name,
-                    normalizedName,
-                    category: tag.category || 'other',
-                    projectId,
-                    sourceNodeId: nodeEnrich.nodeId,
-                  });
-                  tagsCreated++;
-                }
-              }
-            }
-          }
-
-          logger.info(`[UnifiedIngestion] Created ${entitiesCreated} Entity nodes, ${tagsCreated} Tag nodes`);
-
-          // Resolve/deduplicate entities and tags
-          let canonicalCreated = 0;
-          if (entitiesCreated > 0 || tagsCreated > 0) {
-            const resolver = entityResolutionService || new EntityResolutionService(
-              this.neo4j,
-              process.env.ANTHROPIC_API_KEY || ''
-            );
-
-            // Resolve entities (merge duplicates into CanonicalEntity nodes)
-            if (entitiesCreated > 0) {
-              const entityResolution = await resolver.resolveEntities();
-              canonicalCreated = entityResolution.created.length + entityResolution.merged.length;
-              logger.info(`[UnifiedIngestion] Entity resolution: ${entityResolution.created.length} created, ${entityResolution.merged.length} merged`);
-            }
-
-            // Resolve tags (merge duplicates)
-            if (tagsCreated > 0) {
-              const tagResolution = await resolver.resolveTags();
-              logger.info(`[UnifiedIngestion] Tag resolution: ${tagResolution.normalized} normalized, ${tagResolution.merged} merged`);
-            }
-          }
-
-          entityStats = {
-            entitiesExtracted: enrichResult.entities.length,
-            tagsExtracted: enrichResult.tags.length,
-            canonicalEntitiesCreated: canonicalCreated,
-            entityRelationshipsCreated: entityRelsCreated,
-          };
-        } else {
-          logger.info(`[UnifiedIngestion] No enrichable content found (no sections or media descriptions)`);
-        }
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        logger.warn(`[UnifiedIngestion] Entity extraction failed: ${errMsg}`);
-        allWarnings.push(`Entity extraction failed: ${errMsg}`);
-      }
-    }
-
     // Generate embeddings in batch
     let embeddingsGenerated = 0;
     if (generateEmbeddings && allNodes.length > 0) {
       embeddingsGenerated = await this.generateEmbeddingsForDocument(documentId);
     }
 
-    const entityLogPart = entityStats ? `, ${entityStats.entitiesExtracted} entities, ${entityStats.tagsExtracted} tags` : '';
-    logger.info(`[UnifiedIngestion] Complete: ${allNodes.length} nodes, ${allRelationships.length} rels, ${embeddingsGenerated} embeddings${entityLogPart}`);
+    logger.info(`[UnifiedIngestion] Complete: ${allNodes.length} nodes, ${allRelationships.length} rels, ${embeddingsGenerated} embeddings`);
 
     return {
       nodesCreated: allNodes.length,
       relationshipsCreated: allRelationships.length,
       embeddingsGenerated,
       stats,
-      entityStats,
       warnings: allWarnings.length > 0 ? allWarnings : undefined,
     };
   }
@@ -1399,28 +1378,13 @@ export class CommunityOrchestratorAdapter {
   }
 
   /**
-   * Create a default title generator using EnrichmentService.
-   * Delegates to EnrichmentService.generateSectionTitles for centralized LLM calls.
+   * Create a default title generator (disabled - no LLM enrichment).
+   * Title generation is now disabled as EnrichmentService was removed.
    */
   private createDefaultTitleGenerator(): (sections: Array<{ index: number; content: string }>) => Promise<Array<{ index: number; title: string }>> {
     return async (sections) => {
-      if (sections.length === 0) return [];
-
-      // Check for API key
-      const apiKey = process.env.ANTHROPIC_API_KEY;
-      if (!apiKey) {
-        logger.warn(`[TitleGenerator] ANTHROPIC_API_KEY not set, skipping title generation`);
-        return [];
-      }
-
-      try {
-        // Use EnrichmentService for centralized LLM calls
-        const enrichmentService = createEnrichmentService();
-        return await enrichmentService.generateSectionTitles(sections);
-      } catch (error) {
-        logger.warn(`[TitleGenerator] Failed to generate titles: ${error}`);
-        return [];
-      }
+      // Title generation disabled - EnrichmentService removed
+      return [];
     };
   }
 
@@ -1719,7 +1683,8 @@ export class CommunityOrchestratorAdapter {
 
     // Map to community format with snippets
     let communityResults: CommunitySearchResult[] = result.results.map((r) => {
-      const content = (r.node.content || r.node.source || r.node.description || r.node.text || "") as string;
+      // Use normalized field names: _content, _description, _name
+      const content = (r.node._content || r.node._description || r.node._name || "") as string;
 
       // Generate snippet: prefer chunkText, fallback to truncated content
       let snippet: string | undefined;

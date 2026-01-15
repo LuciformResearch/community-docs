@@ -231,7 +231,7 @@ Returns matching content with relevance scores.`,
             rank: i + 1,
             score: r.score.toFixed(3),
             documentTitle: r.node.documentTitle || "Untitled",
-            content: r.node.content || r.node.ownContent || "",
+            content: r.node._content || "",
             documentId: r.node.documentId,
           }));
 

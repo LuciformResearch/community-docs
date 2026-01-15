@@ -41,11 +41,13 @@ import { getNeo4jClient, closeNeo4jClient, type Neo4jClient } from "../neo4j-cli
 import { OllamaEmbeddingService, type OllamaEmbeddingConfig } from "../embedding-service";
 import { CommunityOrchestratorAdapter } from "../orchestrator-adapter";
 import { getSupportedExtensions } from "../parsers";
-import { getAPILogger, LOG_FILES } from "../logger";
+import { getAPILogger, LOG_FILES, interceptConsole } from "../logger";
+
+// Intercept ALL console.* calls and redirect to log files
+// This must be called early, before any other code runs
+interceptConsole();
 import type { CommunityNodeMetadata, SearchResult, SearchFilters } from "../types";
 // LLM Enrichment Services
-import { EnrichmentService, type EnrichmentOptions, type DocumentContext, type NodeToEnrich } from "../enrichment-service";
-import { EntityResolutionService, type EntityResolutionOptions } from "../entity-resolution-service";
 import { EntityEmbeddingService, type EntitySearchOptions, type EntitySearchResult } from "../entity-embedding-service";
 // Chat Agent Routes (Vercel AI SDK + Claude)
 import { registerChatRoutes } from "./routes/chat";
@@ -306,7 +308,6 @@ export class CommunityAPIServer {
   private neo4j: Neo4jClient | null = null;
   private embedding: OllamaEmbeddingService | null = null;
   private orchestrator: CommunityOrchestratorAdapter | null = null;
-  private enrichment: EnrichmentService | null = null;
   private entityEmbedding: EntityEmbeddingService | null = null;
   private startTime: Date;
   private requestCount: number = 0;
@@ -457,21 +458,18 @@ export class CommunityAPIServer {
             },
           }
         : undefined,
-      verbose: false,
+      // Enable entity extraction via GLiNER
+      entityExtraction: {
+        enabled: true,
+        serviceUrl: process.env.GLINER_SERVICE_URL || 'http://localhost:6971',
+        autoDetectDomain: true, // Classify first, then extract per domain (fastest with CUDA)
+        confidenceThreshold: 0.5,
+        timeoutMs: 60000, // 1 minute should be enough with CUDA
+      },
+      verbose: process.env.RAGFORGE_VERBOSE === 'true',  // Enable with RAGFORGE_VERBOSE=true
     });
     await this.orchestrator.initialize();
-    logger.info("Orchestrator initialized for virtual file ingestion (with core EmbeddingService)");
-
-    // Initialize LLM enrichment service (optional - only if ANTHROPIC_API_KEY is set)
-    const anthropicKey = process.env.ANTHROPIC_API_KEY;
-    if (anthropicKey) {
-      this.enrichment = new EnrichmentService(anthropicKey, {
-        model: process.env.ENRICHMENT_MODEL || "claude-3-5-haiku-20241022",
-      });
-      logger.info("EnrichmentService initialized (Claude LLM)");
-    } else {
-      logger.info("EnrichmentService disabled (no ANTHROPIC_API_KEY)");
-    }
+    logger.info(`Orchestrator initialized (verbose: ${process.env.RAGFORGE_VERBOSE === 'true'})`);
 
     // Initialize EntityEmbeddingService for Entity/Tag embeddings and search
     if (this.embedding) {
@@ -748,7 +746,6 @@ export class CommunityAPIServer {
           generateTitles,
           generateEmbeddings,
           extractEntities,
-          enrichmentService: extractEntities && this.enrichment ? this.enrichment : undefined,
         });
 
         return {
@@ -1073,11 +1070,12 @@ export class CommunityAPIServer {
           documentId: r.node.documentId as string,
           chunkId: r.node.chunkId as string | undefined,
           // Use snippet for agent-friendly output (truncated or chunk text)
-          content: r.snippet || (r.node.content || r.node.source || r.node.description) as string,
+          // Use normalized field names: _content, _description, _name
+          content: r.snippet || (r.node._content || r.node._description || r.node._name) as string,
           score: r.score,
           // Include source file info
           sourcePath: (r.filePath || r.node.sourcePath || r.node.file) as string | undefined,
-          nodeType: r.node._labels?.[0] as string | undefined,
+          nodeType: r.node.labels?.[0] as string | undefined,
           // Matched range info (when a chunk matched)
           matchedRange: r.matchedRange,
           // Position info from the node (useful for navigation)
@@ -1511,21 +1509,6 @@ export class CommunityAPIServer {
         return { success: false, error: "Orchestrator not available" };
       }
 
-      // Parse enrichment options from query string
-      const enrichmentEnabled = request.query.enableEnrichment === "true";
-      const enrichmentOptions: Partial<EnrichmentOptions> = {
-        enableLLMEnrichment: enrichmentEnabled,
-        extractEntities: request.query.extractEntities !== "false",
-        extractTags: request.query.extractTags !== "false",
-        generateSummary: request.query.generateSummary !== "false",
-        suggestCategory: request.query.suggestCategory !== "false",
-      };
-
-      if (enrichmentEnabled && !this.enrichment) {
-        reply.status(400);
-        return { success: false, error: "Enrichment requested but ANTHROPIC_API_KEY not configured" };
-      }
-
       try {
         const data = await request.file();
         if (!data) {
@@ -1538,7 +1521,7 @@ export class CommunityAPIServer {
         const documentId = `doc-${Date.now()}`;
         const projectId = `doc-${documentId}`;
 
-        logger.info(`[Upload] ${fileName} (${buffer.length} bytes), enrichment: ${enrichmentEnabled}`);
+        logger.info(`[Upload] ${fileName} (${buffer.length} bytes})`);
 
         // Default metadata
         const metadata: CommunityNodeMetadata = {
@@ -1584,124 +1567,6 @@ export class CommunityAPIServer {
 
         const embeddingsGenerated = result.embeddingsGenerated;
 
-        // LLM Enrichment (if enabled)
-        let enrichmentResult = null;
-        if (enrichmentEnabled && this.enrichment) {
-          logger.info(`[Upload] Running LLM enrichment for ${documentId}...`);
-
-          // Query ONLY document/text nodes for enrichment (NOT code)
-          // Includes: markdown, documents, web pages, and vision-described media
-          // Excludes: Scope (code), CodeBlock (code in markdown)
-          const nodesResult = await this.neo4j!.run(`
-            MATCH (n)
-            WHERE n.documentId = $documentId
-            AND (
-              n:MarkdownSection OR n:MarkdownDocument OR
-              n:PDFDocument OR n:WordDocument OR n:DataFile OR
-              n:WebPage OR
-              n:ImageFile OR n:ThreeDFile OR n:MediaFile
-            )
-            AND NOT n:CodeBlock
-            RETURN n.uuid AS uuid, labels(n)[0] AS nodeType, n.name AS name,
-                   coalesce(n.content, n.rawContent, n.textContent, n.description, n.visionDescription, n.ocrText, '') AS content
-            LIMIT 50
-          `, { documentId });
-
-          const nodes: NodeToEnrich[] = nodesResult.records.map((r) => ({
-            uuid: r.get("uuid"),
-            nodeType: r.get("nodeType"),
-            name: r.get("name") || "Untitled",
-            content: r.get("content") || "",
-          }));
-
-          if (nodes.length > 0) {
-            const context: DocumentContext = {
-              documentId,
-              title: metadata.documentTitle,
-              projectId,
-              nodes,
-            };
-
-            this.enrichment.updateOptions(enrichmentOptions);
-            enrichmentResult = await this.enrichment.enrichDocument(context);
-
-            // Store entities with CONTAINS_ENTITY relationships to source nodes
-            let entitiesCreated = 0;
-            let containsRelCreated = 0;
-
-            if (enrichmentResult.nodeEnrichments) {
-              for (const nodeEnrich of enrichmentResult.nodeEnrichments) {
-                // Create entities linked to their source node
-                if (nodeEnrich.entities && nodeEnrich.entities.length > 0) {
-                  for (const entity of nodeEnrich.entities) {
-                    await this.neo4j!.run(`
-                      // Create Entity node
-                      CREATE (e:Entity {
-                        uuid: randomUUID(),
-                        name: $name,
-                        normalizedName: toLower($name),
-                        entityType: $type,
-                        confidence: $confidence,
-                        aliases: $aliases,
-                        projectId: $projectId,
-                        documentId: $documentId,
-                        sourceNodeId: $sourceNodeId,
-                        createdAt: datetime()
-                      })
-                      // Link to source node via CONTAINS_ENTITY
-                      WITH e
-                      MATCH (source {uuid: $sourceNodeId})
-                      CREATE (source)-[:CONTAINS_ENTITY {confidence: $confidence}]->(e)
-                    `, {
-                      name: entity.name,
-                      type: entity.type,
-                      confidence: entity.confidence,
-                      aliases: entity.aliases || [],
-                      projectId,
-                      documentId,
-                      sourceNodeId: nodeEnrich.nodeId,
-                    });
-                    entitiesCreated++;
-                    containsRelCreated++;
-                  }
-                }
-
-                // Create HAS_TAG relationships to source nodes
-                if (nodeEnrich.tags && nodeEnrich.tags.length > 0) {
-                  for (const tag of nodeEnrich.tags) {
-                    // Compute normalizedName in JS to match the constraint key
-                    const normalizedName = tag.name.toLowerCase().replace(/\s+/g, '-');
-                    await this.neo4j!.run(`
-                      // Get or create Tag node using normalizedName as unique key
-                      MERGE (t:Tag {normalizedName: $normalizedName})
-                      ON CREATE SET t.uuid = randomUUID(), t.name = $name, t.category = $category,
-                                    t.createdAt = datetime()
-                      ON MATCH SET t.name = CASE WHEN t.name IS NULL THEN $name ELSE t.name END
-                      SET t.projectIds = CASE
-                        WHEN $projectId IN coalesce(t.projectIds, []) THEN t.projectIds
-                        ELSE coalesce(t.projectIds, []) + $projectId
-                      END,
-                      t.usageCount = coalesce(t.usageCount, 0) + 1
-                      // Link to source node
-                      WITH t
-                      MATCH (source {uuid: $sourceNodeId})
-                      MERGE (source)-[:HAS_TAG]->(t)
-                    `, {
-                      name: tag.name,
-                      normalizedName,
-                      category: tag.category || "other",
-                      projectId,
-                      sourceNodeId: nodeEnrich.nodeId,
-                    });
-                  }
-                }
-              }
-            }
-
-            logger.info(`[Upload] Created ${entitiesCreated} Entity nodes, ${containsRelCreated} CONTAINS_ENTITY relations`);
-          }
-        }
-
         return {
           success: true,
           documentId,
@@ -1711,80 +1576,9 @@ export class CommunityAPIServer {
           nodesCreated: result.nodesCreated,
           relationshipsCreated: result.relationshipsCreated,
           embeddingsGenerated,
-          enrichment: enrichmentResult ? {
-            entitiesExtracted: enrichmentResult.entities.length,
-            tagsExtracted: enrichmentResult.tags.length,
-            suggestedCategory: enrichmentResult.suggestedCategory,
-            processingTimeMs: enrichmentResult.metadata.processingTimeMs,
-          } : null,
         };
       } catch (err: any) {
         logger.error(`[Upload] Failed: ${err.message}`);
-        reply.status(500);
-        return { success: false, error: err.message };
-      }
-    });
-
-    // =========================================================================
-    // Admin: Entity Resolution (cross-document deduplication)
-    // =========================================================================
-    this.server.post<{
-      Body: {
-        dryRun?: boolean;
-        minSimilarity?: number;
-        maxEntities?: number;
-      };
-    }>("/admin/resolve-entities", async (request, reply) => {
-      if (!this.enrichment) {
-        reply.status(400);
-        return { success: false, error: "ANTHROPIC_API_KEY not configured - entity resolution requires LLM" };
-      }
-
-      const { dryRun = false, minSimilarity = 0.8, maxEntities = 500 } = request.body || {};
-
-      logger.info(`[Admin] Entity resolution started (dryRun: ${dryRun})`);
-
-      try {
-        const resolutionService = new EntityResolutionService(
-          this.neo4j!,
-          process.env.ANTHROPIC_API_KEY!,
-          { dryRun, minSimilarity, maxEntities }
-        );
-
-        const result = await resolutionService.resolveEntities();
-        const canonicalMergeResult = await resolutionService.mergeCanonicals();
-        const tagResult = await resolutionService.resolveTags();
-
-        // Generate embeddings for Entity/Tag nodes (for hybrid search)
-        let embeddingResult = null;
-        if (this.entityEmbedding && !dryRun) {
-          logger.info("[Admin] Generating embeddings for Entity/Tag nodes...");
-          embeddingResult = await this.entityEmbedding.generateEmbeddings();
-          logger.info(`[Admin] Entity embeddings: ${embeddingResult.entitiesEmbedded} entities, ${embeddingResult.tagsEmbedded} tags`);
-        }
-
-        logger.info(`[Admin] Resolution complete: ${result.merged.length} entities merged, ${result.created.length} created, ${canonicalMergeResult.merged} canonicals deduplicated, ${tagResult.llmMerged} tags LLM-merged`);
-
-        return {
-          success: true,
-          entities: {
-            merged: result.merged.length,
-            created: result.created.length,
-            totalProcessed: result.totalProcessed,
-            canonicalsMerged: canonicalMergeResult.merged,
-          },
-          tags: tagResult,
-          embeddings: embeddingResult ? {
-            entitiesEmbedded: embeddingResult.entitiesEmbedded,
-            tagsEmbedded: embeddingResult.tagsEmbedded,
-            skipped: embeddingResult.skipped,
-            durationMs: embeddingResult.durationMs,
-          } : null,
-          processingTimeMs: result.processingTimeMs,
-          dryRun,
-        };
-      } catch (err: any) {
-        logger.error(`[Admin] Entity resolution failed: ${err.message}`);
         reply.status(500);
         return { success: false, error: err.message };
       }

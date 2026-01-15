@@ -237,6 +237,12 @@ export class Neo4jClient {
       "CREATE INDEX webpage_uuid IF NOT EXISTS FOR (n:WebPage) ON (n.uuid)",
       "CREATE INDEX webreference_uuid IF NOT EXISTS FOR (n:WebReference) ON (n.uuid)",
 
+      // Entity indexes (GLiNER extraction) - CRITICAL for upsert performance
+      "CREATE INDEX entity_uuid IF NOT EXISTS FOR (n:Entity) ON (n.uuid)",
+      "CREATE INDEX entity_projectId IF NOT EXISTS FOR (n:Entity) ON (n.projectId)",
+      "CREATE INDEX entity_entityType IF NOT EXISTS FOR (n:Entity) ON (n.entityType)",
+      "CREATE INDEX entity_name IF NOT EXISTS FOR (n:Entity) ON (n._name)",
+
       // Filtering indexes for community-docs specific queries
       "CREATE INDEX node_documentId IF NOT EXISTS FOR (n:Scope) ON (n.documentId)",
       "CREATE INDEX node_userId IF NOT EXISTS FOR (n:Scope) ON (n.userId)",
