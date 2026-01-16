@@ -342,6 +342,11 @@ export interface UnifiedIngestionResult {
     binaryNodes: number;
     mediaNodes: number;
   };
+  /** Entity extraction stats (GLiNER) */
+  entityStats?: {
+    entitiesExtracted: number;
+    filesProcessed: number;
+  };
   /** Warnings from parsing */
   warnings?: string[];
 }

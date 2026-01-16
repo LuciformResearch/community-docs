@@ -8,6 +8,10 @@
  */
 
 import neo4j, { Driver, Session, QueryResult } from "neo4j-driver";
+import {
+  ensureBaseIndexes,
+  ensureFulltextIndexes,
+} from "@luciformresearch/ragforge";
 
 export interface Neo4jClientConfig {
   uri: string;
@@ -212,83 +216,42 @@ export class Neo4jClient {
 
   /**
    * Check if indexes exist, create if not
+   *
+   * Uses centralized index management from @luciformresearch/ragforge
+   * and adds community-docs specific indexes.
    */
   async ensureIndexes(): Promise<void> {
-    const indexes = [
-      // UUID indexes - CRITICAL for relationship creation performance
-      "CREATE INDEX scope_uuid IF NOT EXISTS FOR (n:Scope) ON (n.uuid)",
-      "CREATE INDEX file_uuid IF NOT EXISTS FOR (n:File) ON (n.uuid)",
-      "CREATE INDEX project_uuid IF NOT EXISTS FOR (n:Project) ON (n.uuid)",
-      "CREATE INDEX directory_uuid IF NOT EXISTS FOR (n:Directory) ON (n.uuid)",
-      "CREATE INDEX markdowndocument_uuid IF NOT EXISTS FOR (n:MarkdownDocument) ON (n.uuid)",
-      "CREATE INDEX markdownsection_uuid IF NOT EXISTS FOR (n:MarkdownSection) ON (n.uuid)",
-      "CREATE INDEX codeblock_uuid IF NOT EXISTS FOR (n:CodeBlock) ON (n.uuid)",
-      "CREATE INDEX externallibrary_uuid IF NOT EXISTS FOR (n:ExternalLibrary) ON (n.uuid)",
-      "CREATE INDEX datafile_uuid IF NOT EXISTS FOR (n:DataFile) ON (n.uuid)",
-      "CREATE INDEX documentfile_uuid IF NOT EXISTS FOR (n:DocumentFile) ON (n.uuid)",
-      "CREATE INDEX mediafile_uuid IF NOT EXISTS FOR (n:MediaFile) ON (n.uuid)",
-      "CREATE INDEX canonicalentity_uuid IF NOT EXISTS FOR (n:CanonicalEntity) ON (n.uuid)",
-      "CREATE INDEX tag_uuid IF NOT EXISTS FOR (n:Tag) ON (n.uuid)",
-      "CREATE INDEX datasection_uuid IF NOT EXISTS FOR (n:DataSection) ON (n.uuid)",
-      "CREATE INDEX embeddingchunk_uuid IF NOT EXISTS FOR (n:EmbeddingChunk) ON (n.uuid)",
-      "CREATE INDEX externalurl_uuid IF NOT EXISTS FOR (n:ExternalURL) ON (n.uuid)",
-      "CREATE INDEX packagejson_uuid IF NOT EXISTS FOR (n:PackageJson) ON (n.uuid)",
-      "CREATE INDEX threedfile_uuid IF NOT EXISTS FOR (n:ThreeDFile) ON (n.uuid)",
-      "CREATE INDEX webpage_uuid IF NOT EXISTS FOR (n:WebPage) ON (n.uuid)",
-      "CREATE INDEX webreference_uuid IF NOT EXISTS FOR (n:WebReference) ON (n.uuid)",
+    // Use centralized indexes from ragforge-core
+    // Note: We pass 'this' which has a compatible run() method
+    await ensureBaseIndexes(this as any, { verbose: false });
+    await ensureFulltextIndexes(this as any, { verbose: false });
 
-      // Entity indexes (GLiNER extraction) - CRITICAL for upsert performance
-      "CREATE INDEX entity_uuid IF NOT EXISTS FOR (n:Entity) ON (n.uuid)",
-      "CREATE INDEX entity_projectId IF NOT EXISTS FOR (n:Entity) ON (n.projectId)",
-      "CREATE INDEX entity_entityType IF NOT EXISTS FOR (n:Entity) ON (n.entityType)",
-      "CREATE INDEX entity_name IF NOT EXISTS FOR (n:Entity) ON (n._name)",
-
+    // Community-docs specific indexes (not in ragforge-core)
+    const communityIndexes = [
       // Filtering indexes for community-docs specific queries
       "CREATE INDEX node_documentId IF NOT EXISTS FOR (n:Scope) ON (n.documentId)",
       "CREATE INDEX node_userId IF NOT EXISTS FOR (n:Scope) ON (n.userId)",
       "CREATE INDEX node_categoryId IF NOT EXISTS FOR (n:Scope) ON (n.categoryId)",
       "CREATE INDEX node_categorySlug IF NOT EXISTS FOR (n:Scope) ON (n.categorySlug)",
 
-      // File path indexes - CRITICAL for processVirtualFileReferences performance
-      // The reference linking queries search by file/path/absolutePath on multiple node types
+      // Additional path indexes used by community-docs
       "CREATE INDEX scope_file IF NOT EXISTS FOR (n:Scope) ON (n.file)",
       "CREATE INDEX scope_path IF NOT EXISTS FOR (n:Scope) ON (n.path)",
       "CREATE INDEX file_path IF NOT EXISTS FOR (n:File) ON (n.path)",
-      "CREATE INDEX file_absolutePath IF NOT EXISTS FOR (n:File) ON (n.absolutePath)",
       "CREATE INDEX markdowndocument_path IF NOT EXISTS FOR (n:MarkdownDocument) ON (n.path)",
       "CREATE INDEX markdownsection_file IF NOT EXISTS FOR (n:MarkdownSection) ON (n.file)",
       "CREATE INDEX markdownsection_path IF NOT EXISTS FOR (n:MarkdownSection) ON (n.path)",
 
-      // projectId indexes for filtering by project
-      "CREATE INDEX scope_projectId IF NOT EXISTS FOR (n:Scope) ON (n.projectId)",
-      "CREATE INDEX file_projectId IF NOT EXISTS FOR (n:File) ON (n.projectId)",
+      // Additional projectId indexes
       "CREATE INDEX markdowndocument_projectId IF NOT EXISTS FOR (n:MarkdownDocument) ON (n.projectId)",
       "CREATE INDEX markdownsection_projectId IF NOT EXISTS FOR (n:MarkdownSection) ON (n.projectId)",
-
-      // Unified fulltext index for BM25 search on all content nodes
-      // Searches on _name, _content, _description fields extracted by IncrementalIngestionManager
-      `CREATE FULLTEXT INDEX unified_fulltext IF NOT EXISTS FOR (n:Scope|File|DataFile|DocumentFile|PDFDocument|WordDocument|SpreadsheetDocument|MarkdownDocument|MarkdownSection|MediaFile|ImageFile|ThreeDFile|WebPage|CodeBlock|VueSFC|SvelteComponent|Stylesheet|GenericFile|PackageJson|DataSection|WebDocument) ON EACH [n._name, n._content, n._description]`,
     ];
 
-    const constraints = [
-      // Unique constraints to prevent race conditions during concurrent ingestion
-      "CREATE CONSTRAINT canonical_entity_unique IF NOT EXISTS FOR (c:CanonicalEntity) REQUIRE (c.normalizedName, c.entityType) IS UNIQUE",
-      "CREATE CONSTRAINT tag_unique IF NOT EXISTS FOR (t:Tag) REQUIRE (t.normalizedName) IS UNIQUE",
-    ];
-
-    for (const idx of indexes) {
+    for (const idx of communityIndexes) {
       try {
         await this.run(idx);
       } catch (e) {
         // Index might already exist, ignore
-      }
-    }
-
-    for (const constraint of constraints) {
-      try {
-        await this.run(constraint);
-      } catch (e) {
-        // Constraint might already exist, ignore
       }
     }
   }
