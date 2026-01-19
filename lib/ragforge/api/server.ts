@@ -307,6 +307,8 @@ export class CommunityAPIServer {
   private server: FastifyInstance;
   private neo4j: Neo4jClient | null = null;
   private embedding: OllamaEmbeddingService | null = null;
+  private embeddingProvider: string | null = null; // "tei" or "ollama"
+  private embeddingDimension: number = 768; // Default TEI dimension
   private orchestrator: CommunityOrchestratorAdapter | null = null;
   private entityEmbedding: EntityEmbeddingService | null = null;
   private startTime: Date;
@@ -429,35 +431,73 @@ export class CommunityAPIServer {
 
     await this.neo4j.ensureIndexes();
 
-    // Initialize Ollama embedding service
-    const ollamaConfig: OllamaEmbeddingConfig = {
-      baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
-      model: process.env.OLLAMA_EMBEDDING_MODEL || "mxbai-embed-large",
-    };
-    this.embedding = new OllamaEmbeddingService(ollamaConfig);
+    // Initialize embedding service (TEI or Ollama based on EMBEDDING_PROVIDER)
+    const embeddingProvider = process.env.EMBEDDING_PROVIDER || "tei"; // Default to TEI
 
-    const ollamaOk = await this.embedding.checkHealth();
-    if (!ollamaOk) {
-      logger.warn( "Ollama not available - embeddings disabled");
-      this.embedding = null;
-    } else {
-      logger.info( `Ollama connected (model: ${ollamaConfig.model})`);
+    let embeddingConfig: import("@luciformresearch/ragforge").EmbeddingProviderConfig | undefined;
+
+    if (embeddingProvider === "tei") {
+      // TEI (Text Embeddings Inference) - GPU-accelerated, faster
+      const teiBaseUrl = process.env.TEI_BASE_URL || "http://localhost:8081";
+      try {
+        const healthCheck = await fetch(`${teiBaseUrl}/health`);
+        if (healthCheck.ok) {
+          logger.info(`TEI connected (${teiBaseUrl})`);
+          this.embeddingProvider = "tei";
+          this.embeddingDimension = 768;
+          embeddingConfig = {
+            provider: "tei",
+            options: {
+              baseUrl: teiBaseUrl,
+              batchSize: 32, // TEI default max
+            },
+          };
+        } else {
+          logger.warn(`TEI not available at ${teiBaseUrl} - falling back to Ollama`);
+        }
+      } catch {
+        logger.warn(`TEI not available at ${teiBaseUrl} - falling back to Ollama`);
+      }
+    }
+
+    // Fallback to Ollama if TEI not configured or not available
+    if (!embeddingConfig) {
+      const ollamaConfig: OllamaEmbeddingConfig = {
+        baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
+        model: process.env.OLLAMA_EMBEDDING_MODEL || "mxbai-embed-large",
+      };
+      this.embedding = new OllamaEmbeddingService(ollamaConfig);
+
+      const ollamaOk = await this.embedding.checkHealth();
+      if (!ollamaOk) {
+        logger.warn("Ollama not available - embeddings disabled");
+        this.embedding = null;
+      } else {
+        logger.info(`Ollama connected (model: ${ollamaConfig.model})`);
+        this.embeddingProvider = "ollama";
+        this.embeddingDimension = 1024;
+        embeddingConfig = {
+          provider: "ollama",
+          model: ollamaConfig.model,
+          options: {
+            baseUrl: ollamaConfig.baseUrl,
+            batchSize: 10,
+          },
+        };
+      }
+    }
+
+    // Ensure vector indexes with the correct dimension for chosen provider
+    if (this.embeddingProvider) {
+      await this.neo4j.ensureVectorIndexes(this.embeddingDimension);
+      logger.info(`Vector indexes ensured (dimension: ${this.embeddingDimension})`);
     }
 
     // Initialize orchestrator for all file ingestion (file, batch, GitHub)
     // Uses ragforge core EmbeddingService with batching for efficiency
     this.orchestrator = new CommunityOrchestratorAdapter({
       neo4j: this.neo4j!,
-      embeddingConfig: this.embedding
-        ? {
-            provider: "ollama",
-            model: process.env.OLLAMA_EMBEDDING_MODEL || "mxbai-embed-large",
-            options: {
-              baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434",
-              batchSize: 10,
-            },
-          }
-        : undefined,
+      embeddingConfig,
       // Enable entity extraction via GLiNER
       entityExtraction: {
         enabled: true,
@@ -472,22 +512,48 @@ export class CommunityAPIServer {
     logger.info(`Orchestrator initialized (verbose: ${process.env.RAGFORGE_VERBOSE === 'true'})`);
 
     // Initialize EntityEmbeddingService for Entity/Tag embeddings and search
-    if (this.embedding) {
+    // Supports both TEI and Ollama providers
+    if (embeddingConfig) {
+      const isTei = embeddingConfig.provider === "tei";
+      const teiBaseUrl = process.env.TEI_BASE_URL || "http://localhost:8081";
+
       this.entityEmbedding = new EntityEmbeddingService({
         neo4jClient: this.neo4j!,
         embedFunction: async (texts: string[]) => {
-          // Use Ollama batch embedding (one at a time for compatibility)
-          const embeddings: number[][] = [];
-          for (const text of texts) {
-            const emb = await this.embedding!.embed(text);
-            embeddings.push(emb);
+          if (isTei) {
+            // TEI batch embedding
+            const response = await fetch(`${teiBaseUrl}/embed`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ inputs: texts }),
+            });
+            if (!response.ok) throw new Error(`TEI error: ${response.status}`);
+            return await response.json() as number[][];
+          } else {
+            // Ollama batch embedding (one at a time)
+            const embeddings: number[][] = [];
+            for (const text of texts) {
+              const emb = await this.embedding!.embed(text);
+              embeddings.push(emb);
+            }
+            return embeddings;
           }
-          return embeddings;
         },
         embedSingle: async (text: string) => {
-          return this.embedding!.embed(text);
+          if (isTei) {
+            const response = await fetch(`${teiBaseUrl}/embed`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ inputs: [text] }),
+            });
+            if (!response.ok) throw new Error(`TEI error: ${response.status}`);
+            const result = await response.json() as number[][];
+            return result[0];
+          } else {
+            return this.embedding!.embed(text);
+          }
         },
-        dimension: 1024, // mxbai-embed-large dimension
+        dimension: this.embeddingDimension,
         verbose: false,
       });
 
@@ -523,7 +589,7 @@ export class CommunityAPIServer {
       uptime_ms: Date.now() - this.startTime.getTime(),
       request_count: this.requestCount,
       neo4j: { connected: !!this.neo4j },
-      embedding: { enabled: !!this.embedding, provider: "ollama" },
+      embedding: { enabled: !!this.embeddingProvider, provider: this.embeddingProvider || "none", dimension: this.embeddingDimension },
     }));
 
     // Document Ingestion
@@ -663,27 +729,29 @@ export class CommunityAPIServer {
         // Decode base64 content to Buffer
         const buffer = Buffer.from(content, "base64");
 
-        // Use unified ingestion
-        const result = await this.orchestrator.ingestFiles({
-          files: [{ fileName: filePath, buffer }],
+        // Use unified ingestion (Simplified method)
+        const result = await this.orchestrator.ingestFilesSimplified(
+          [{ fileName: filePath, buffer }],
+          metadata.projectId,
           metadata,
-          documentId: metadata.documentId,
-          enableVision,
-          visionAnalyzer: enableVision ? this.createVisionAnalyzer() : undefined,
-          render3D: enableVision ? this.createRender3DFunction() : undefined,
-          sectionTitles,
-          generateTitles,
-          generateEmbeddings,
-        });
+          {
+            enableVision,
+            visionAnalyzer: enableVision ? this.createVisionAnalyzer() : undefined,
+            render3D: enableVision ? this.createRender3DFunction() : undefined,
+            sectionTitles,
+            generateTitles,
+            generateEmbeddings,
+          }
+        );
 
         return {
           success: true,
+          projectId: metadata.projectId,
           documentId: metadata.documentId,
-          nodesCreated: result.nodesCreated,
-          relationshipsCreated: result.relationshipsCreated,
+          nodesCreated: result.filesProcessed + result.scopesCreated,
+          relationshipsCreated: result.relationsCreated,
           embeddingsGenerated: result.embeddingsGenerated,
           totalTimeMs: Date.now() - startTime,
-          warnings: result.warnings,
         };
       } catch (err: any) {
         logger.error(`File ingestion failed: ${err.message}`);
@@ -734,31 +802,31 @@ export class CommunityAPIServer {
           buffer: Buffer.from(f.content, "base64"),
         }));
 
-        // Use unified ingestion (handles all file types)
-        const result = await this.orchestrator.ingestFiles({
-          files: filesToIngest,
+        // Use unified ingestion (Simplified method)
+        const result = await this.orchestrator.ingestFilesSimplified(
+          filesToIngest,
+          metadata.projectId,
           metadata,
-          documentId: metadata.documentId,
-          enableVision,
-          visionAnalyzer: enableVision ? this.createVisionAnalyzer() : undefined,
-          render3D: enableVision ? this.createRender3DFunction() : undefined,
-          sectionTitles,
-          generateTitles,
-          generateEmbeddings,
-          extractEntities,
-        });
+          {
+            enableVision,
+            visionAnalyzer: enableVision ? this.createVisionAnalyzer() : undefined,
+            render3D: enableVision ? this.createRender3DFunction() : undefined,
+            sectionTitles,
+            generateTitles,
+            generateEmbeddings,
+            extractEntities,
+          }
+        );
 
         return {
           success: true,
           documentId: metadata.documentId,
-          nodesCreated: result.nodesCreated,
-          relationshipsCreated: result.relationshipsCreated,
+          nodesCreated: result.filesProcessed + result.scopesCreated,
+          relationshipsCreated: result.relationsCreated,
           embeddingsGenerated: result.embeddingsGenerated,
-          entityStats: result.entityStats,
+          entitiesCreated: result.entitiesCreated,
           filesProcessed: files.length,
-          stats: result.stats,
           totalTimeMs: Date.now() - startTime,
-          warnings: result.warnings,
         };
       } catch (err: any) {
         logger.error(`Batch ingestion failed: ${err.message}`);
@@ -890,38 +958,20 @@ export class CommunityAPIServer {
           }
         }
 
-        // Phase 4: Ingest (parsing + nodes + relationships)
+        // Phase 4: Ingest (parsing + nodes + relationships + embeddings via UnifiedProcessor)
         sendProgress("ingesting", 0, 0, "Starting ingestion pipeline...");
 
-        const result = await this.orchestrator.ingestVirtual({
+        const result = await this.orchestrator.ingestVirtualSimplified(
           virtualFiles,
-          sourceIdentifier,
+          metadata.projectId,
           metadata,
-          onProgress: (phase: string, current: number, total: number, message?: string) => {
-            if (!clientDisconnected) {
-              sendProgress(phase, current, total, message);
-            }
-          },
-        });
+          {
+            sourceIdentifier,
+            generateEmbeddings,
+          }
+        );
 
-        logger.info(`[DEBUG] ingestVirtual completed: ${result.nodesCreated} nodes, ${result.relationshipsCreated} rels`);
-
-        // Phase 5: Generate embeddings
-        logger.info(`[DEBUG] Phase 5: generateEmbeddings=${generateEmbeddings}, hasEmbeddingService=${this.orchestrator.hasEmbeddingService()}`);
-        let embeddingsGenerated = 0;
-        if (generateEmbeddings && this.orchestrator.hasEmbeddingService()) {
-          logger.info(`[DEBUG] Starting embedding generation for document: ${metadata.documentId}`);
-          sendProgress("embeddings", 0, 0, "Starting embedding generation...");
-          embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(
-            metadata.documentId,
-            (current: number, total: number) => {
-              if (!clientDisconnected) {
-                sendProgress("embeddings", current, total, `Generating embeddings: ${current}/${total}`);
-              }
-            }
-          );
-          sendProgress("embeddings", embeddingsGenerated, embeddingsGenerated, `Generated ${embeddingsGenerated} embeddings`);
-        }
+        logger.info(`[DEBUG] ingestVirtualSimplified completed: ${result.filesProcessed} files, ${result.scopesCreated} scopes`);
 
         // Success!
         const duration = Date.now() - startTime;
@@ -930,13 +980,13 @@ export class CommunityAPIServer {
           documentId: metadata.documentId,
           sourceIdentifier,
           filesIngested: virtualFiles.length,
-          nodesCreated: result.nodesCreated,
-          relationshipsCreated: result.relationshipsCreated,
-          embeddingsGenerated,
+          nodesCreated: result.filesProcessed + result.scopesCreated,
+          relationshipsCreated: result.relationsCreated,
+          embeddingsGenerated: result.embeddingsGenerated,
           durationMs: duration,
         });
 
-        logger.info(`GitHub ingestion complete: ${result.nodesCreated} nodes, ${result.relationshipsCreated} rels, ${embeddingsGenerated} embeddings in ${duration}ms`);
+        logger.info(`GitHub ingestion complete: ${result.filesProcessed + result.scopesCreated} nodes, ${result.relationsCreated} rels, ${result.embeddingsGenerated} embeddings in ${duration}ms`);
 
       } catch (err: any) {
         if (!clientDisconnected) {
@@ -1317,6 +1367,20 @@ export class CommunityAPIServer {
       }
     });
 
+    // Delete project (all nodes with matching projectId)
+    this.server.delete<{ Params: { projectId: string } }>("/project/:projectId", async (request, reply) => {
+      const { projectId } = request.params;
+      logger.info(`Deleting project: ${projectId}`);
+
+      try {
+        const deletedCount = await this.neo4j!.deleteProject(projectId);
+        return { success: true, projectId, deletedNodes: deletedCount };
+      } catch (err: any) {
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
     // Update document metadata
     this.server.patch<{ Params: { documentId: string }; Body: Partial<CommunityNodeMetadata> }>(
       "/document/:documentId",
@@ -1333,21 +1397,6 @@ export class CommunityAPIServer {
         }
       }
     );
-
-    // Ensure vector index
-    this.server.post("/indexes/ensure-vector", async (request, reply) => {
-      try {
-        await this.neo4j!.run(
-          `CREATE VECTOR INDEX scope_embedding_content_vector IF NOT EXISTS
-           FOR (n:Scope) ON (n.embedding_content)
-           OPTIONS {indexConfig: {\`vector.dimensions\`: 1024, \`vector.similarity_function\`: 'cosine'}}`
-        );
-        return { success: true, message: "Vector index ensured" };
-      } catch (err: any) {
-        reply.status(500);
-        return { success: false, error: err.message };
-      }
-    });
 
     // Debug: Execute Cypher query directly
     this.server.post<{
@@ -1419,16 +1468,19 @@ export class CommunityAPIServer {
         };
 
         // Use form fields or defaults
-        const documentId = getField('documentId', `debug-${Date.now()}`);
+        const timestamp = Date.now();
+        const projectId = getField('projectId', `debug-project-${timestamp}`);
+        const documentId = getField('documentId', `debug-${timestamp}`);
         const documentTitle = getField('documentTitle', fileName.replace(/\.[^.]+$/, ""));
         const categorySlug = getField('categorySlug', 'debug-uploads');
         const categoryId = getField('categoryId', 'cat-debug');
         const userId = getField('userId', 'debug-user');
 
-        logger.info(`[DEBUG] Upload: ${fileName} (${buffer.length} bytes), enableVision: ${enableVision}, documentId: ${documentId}`);
+        logger.info(`[DEBUG] Upload: ${fileName} (${buffer.length} bytes), enableVision: ${enableVision}, projectId: ${projectId}, documentId: ${documentId}`);
 
         // Metadata from form fields or defaults
-        const metadata = {
+        const metadata: CommunityNodeMetadata = {
+          projectId,
           documentId,
           documentTitle,
           categorySlug,
@@ -1456,20 +1508,22 @@ export class CommunityAPIServer {
           filesToIngest.push({ fileName, buffer });
         }
 
-        // Use unified ingestion from orchestrator
-        const result = await this.orchestrator.ingestFiles({
-          files: filesToIngest,
+        // Use unified ingestion (Simplified method)
+        const result = await this.orchestrator.ingestFilesSimplified(
+          filesToIngest,
+          projectId,
           metadata,
-          documentId,
-          enableVision,
-          visionAnalyzer: enableVision ? this.createVisionAnalyzer() : undefined,
-          render3D: enableVision ? this.createRender3DFunction() : undefined,
-          sectionTitles,
-          generateTitles,
-          generateEmbeddings: true,
-        });
+          {
+            enableVision,
+            visionAnalyzer: enableVision ? this.createVisionAnalyzer() : undefined,
+            render3D: enableVision ? this.createRender3DFunction() : undefined,
+            sectionTitles,
+            generateTitles,
+            generateEmbeddings: true,
+          }
+        );
 
-        if (result.nodesCreated === 0) {
+        if (result.filesProcessed === 0) {
           return { success: false, error: "No supported files found" };
         }
 
@@ -1478,12 +1532,10 @@ export class CommunityAPIServer {
           documentId,
           fileName,
           filesExtracted: filesToIngest.length,
-          filesIngested: result.stats.textFiles + result.stats.binaryDocs + result.stats.mediaFiles,
-          stats: result.stats,
-          nodesCreated: result.nodesCreated,
-          relationshipsCreated: result.relationshipsCreated,
+          filesIngested: result.filesProcessed,
+          nodesCreated: result.filesProcessed + result.scopesCreated,
+          relationshipsCreated: result.relationsCreated,
           embeddingsGenerated: result.embeddingsGenerated,
-          warnings: result.warnings,
         };
       } catch (err: any) {
         logger.error(`[DEBUG] Upload failed: ${err.message}`);
@@ -1518,13 +1570,15 @@ export class CommunityAPIServer {
 
         const buffer = await data.toBuffer();
         const fileName = data.filename;
-        const documentId = `doc-${Date.now()}`;
-        const projectId = `doc-${documentId}`;
+        // Generate debug IDs
+        const projectId = `debug-project-${Date.now()}`;
+        const documentId = `debug-doc-${Date.now()}`;
 
         logger.info(`[Upload] ${fileName} (${buffer.length} bytes})`);
 
         // Default metadata
         const metadata: CommunityNodeMetadata = {
+          projectId,
           documentId,
           documentTitle: fileName.replace(/\.[^.]+$/, ""),
           categorySlug: "uploads",
@@ -1550,32 +1604,31 @@ export class CommunityAPIServer {
           filesToIngest.push({ fileName, buffer });
         }
 
-        // Use unified ingestion
-        const result = await this.orchestrator.ingestFiles({
-          files: filesToIngest,
+        // Use unified ingestion (Simplified method)
+        const result = await this.orchestrator.ingestFilesSimplified(
+          filesToIngest,
+          projectId,
           metadata,
-          documentId,
-          enableVision: false,
-          sectionTitles: 'detect',
-          generateTitles: true,
-          generateEmbeddings: true,
-        });
+          {
+            enableVision: false,
+            sectionTitles: 'detect',
+            generateTitles: true,
+            generateEmbeddings: true,
+          }
+        );
 
-        if (result.nodesCreated === 0) {
+        if (result.filesProcessed === 0) {
           return { success: false, error: "No supported files found" };
         }
-
-        const embeddingsGenerated = result.embeddingsGenerated;
 
         return {
           success: true,
           documentId,
           fileName,
-          filesIngested: result.stats.textFiles + result.stats.binaryDocs + result.stats.mediaFiles,
-          stats: result.stats,
-          nodesCreated: result.nodesCreated,
-          relationshipsCreated: result.relationshipsCreated,
-          embeddingsGenerated,
+          filesIngested: result.filesProcessed,
+          nodesCreated: result.filesProcessed + result.scopesCreated,
+          relationshipsCreated: result.relationsCreated,
+          embeddingsGenerated: result.embeddingsGenerated,
         };
       } catch (err: any) {
         logger.error(`[Upload] Failed: ${err.message}`);

@@ -184,6 +184,31 @@ export class RagForgeAPIClient {
   }
 
   /**
+   * Delete a project and all its nodes from Neo4j
+   * This deletes all File, Scope, Entity nodes with matching projectId
+   */
+  async deleteProject(projectId: string): Promise<{ success: boolean; deletedNodes: number; error?: string }> {
+    const res = await fetch(`${this.baseUrl}/project/${projectId}`, {
+      method: "DELETE",
+    });
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      return {
+        success: false,
+        deletedNodes: 0,
+        error: data.error || `HTTP ${res.status}`,
+      };
+    }
+
+    return {
+      success: true,
+      deletedNodes: data.deletedNodes || 0,
+    };
+  }
+
+  /**
    * Update document metadata in Neo4j
    */
   async updateDocumentMetadata(
@@ -269,10 +294,13 @@ export class RagForgeAPIClient {
 
     const data = await res.json();
 
+    // Use documentId if available, fall back to projectId
+    const docId = params.metadata.documentId ?? params.metadata.projectId;
+
     if (!res.ok) {
       return {
         success: false,
-        documentId: params.metadata.documentId,
+        documentId: docId,
         error: data.error || `HTTP ${res.status}`,
         warnings: data.warnings,
       };
@@ -280,7 +308,7 @@ export class RagForgeAPIClient {
 
     return {
       success: true,
-      documentId: params.metadata.documentId,
+      documentId: docId,
       nodeCount: data.nodesCreated,
       relationshipCount: data.relationshipsCreated,
       embeddingsGenerated: data.embeddingsGenerated,
@@ -325,17 +353,20 @@ export class RagForgeAPIClient {
 
     const data = await res.json();
 
+    // Use documentId if available, fall back to projectId
+    const docId = params.metadata.documentId ?? params.metadata.projectId;
+
     if (!res.ok) {
       return {
         success: false,
-        documentId: params.metadata.documentId,
+        documentId: docId,
         error: data.error || `HTTP ${res.status}`,
       };
     }
 
     return {
       success: true,
-      documentId: params.metadata.documentId,
+      documentId: docId,
       totalNodes: data.totalNodes,
       totalRelationships: data.totalRelationships,
       embeddingsGenerated: data.embeddingsGenerated,
@@ -379,6 +410,7 @@ export function getRagForgeClient(): RagForgeAPIClient {
  */
 export function buildNodeMetadata(document: {
   id: string;
+  projectId: string;  // Prisma Project.id
   title: string;
   categoryId: string;
   uploadedById: string;
@@ -386,6 +418,7 @@ export function buildNodeMetadata(document: {
   uploadedBy: { username: string };
 }): CommunityNodeMetadata {
   return {
+    projectId: document.projectId,
     documentId: document.id,
     documentTitle: document.title,
     userId: document.uploadedById,

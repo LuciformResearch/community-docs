@@ -19,6 +19,7 @@ model User {
 
   // Relations
   documents     Document[]
+  projects      Project[]
   sessions      Session[]
   accounts      Account[]
 
@@ -63,11 +64,45 @@ model Category {
   icon        String?    // Lucide icon name
 
   documents   Document[]
+  projects    Project[]
 
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
 }
 
+// Project = First-class entity that groups sources and conversations
+// Multiple documents/sources can belong to one project
+model Project {
+  id          String      @id @default(cuid())
+  name        String
+  description String?
+
+  // Relations
+  categoryId  String
+  category    Category    @relation(fields: [categoryId], references: [id])
+  ownerId     String
+  owner       User        @relation(fields: [ownerId], references: [id])
+
+  // Sources within this project
+  documents   Document[]
+
+  // Neo4j sync status
+  searchReady SearchCapability @default(NONE)
+
+  // Denormalized stats (updated async)
+  fileCount       Int      @default(0)
+  scopeCount      Int      @default(0)
+  embeddingCount  Int      @default(0)
+  embeddingProgress Json?  // { done: number, total: number }
+
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@index([categoryId])
+  @@index([ownerId])
+}
+
+// Document = A source within a project (upload, GitHub repo, web page, etc.)
 model Document {
   id          String      @id @default(cuid())
   title       String
@@ -80,14 +115,17 @@ model Document {
   virtualPath String      // "/category/project/README.md" for display
   sourceUrl   String?     // GitHub URL for GITHUB type
 
-  // Relations
+  // Relations - Document belongs to a Project
+  projectId   String
+  project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Keep categoryId for backward compat during migration, then remove
   categoryId  String
   category    Category    @relation(fields: [categoryId], references: [id])
+
+  // Who added this source
   uploadedById String
   uploadedBy  User        @relation(fields: [uploadedById], references: [id])
-
-  // Neo4j link
-  projectId   String      // RagForge project ID in Neo4j
 
   // Status
   status      DocStatus   @default(PENDING)
@@ -97,6 +135,8 @@ model Document {
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
   ingestedAt  DateTime?
+
+  @@index([projectId])
 }
 
 // === Enums ===
@@ -149,4 +189,13 @@ enum DocStatus {
   INGESTING
   READY
   ERROR
+}
+
+// Search capability tracking for progressive search
+// BM25 available immediately, embeddings generated async
+enum SearchCapability {
+  NONE      // Project just created, no files yet
+  BM25      // Files parsed, BM25 text search available
+  HYBRID    // Some embeddings generated, partial semantic
+  FULL      // All embeddings complete, full hybrid search
 }

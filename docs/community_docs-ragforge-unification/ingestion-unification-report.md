@@ -2,6 +2,31 @@
 
 **Date**: 2026-01-18
 **Objectif**: Analyser l'état actuel et les actions nécessaires pour unifier les pipelines d'ingestion.
+**Dernière mise à jour**: 2026-01-18
+
+---
+
+## 0. Changements Récents (2026-01-18)
+
+### Architecture Décidée: Prisma + Neo4j Dual Database
+
+- **Projects** gérés en **Prisma** (PostgreSQL), pas en Neo4j
+- **Neo4j** stocke le knowledge graph avec `projectId` comme attribut sur tous les nodes
+- **`projectId`** est maintenant **required** dans `CommunityNodeMetadata`
+- **`documentId`** est maintenant **optionnel** (pour traçabilité source uniquement)
+
+### Modifications Implémentées
+
+| Fichier | Changement |
+|---------|------------|
+| `prisma/schema.prisma` | Ajout model `Project` + enum `SearchCapability` |
+| `lib/ragforge/types.ts` | `projectId: string` required, `documentId?: string` optional |
+| `lib/ragforge/orchestrator-adapter.ts` | Méthode renommée: `generateEmbeddingsForProject()` |
+| `lib/ragforge/orchestrator-adapter.ts` | Suppression du pattern `doc-${documentId}` |
+| `lib/ragforge/api-client.ts` | Ajout `deleteProject()`, update `buildNodeMetadata()` |
+| `lib/ragforge/api/server.ts` | Route `DELETE /project/:projectId` |
+| `lib/ragforge/neo4j-client.ts` | Méthode `deleteProject(projectId)` |
+| `app/api/projects/*` | CRUD routes pour Project |
 
 ---
 
@@ -16,7 +41,7 @@
 | **Community API Endpoint** | `lib/ragforge/api/server.ts:782` (`POST /ingest/github`) | ✅ **IMPLÉMENTÉ** |
 | **Clone Function** | `lib/ragforge/api/server.ts:82-113` (`cloneGitHubRepo`) | ✅ Existe |
 
-### Flow Actuel dans Community-Docs
+### Flow Actuel dans Community-Docs (MISE À JOUR)
 
 ```
 POST /ingest/github
@@ -45,7 +70,8 @@ POST /ingest/github
        ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  4. INGEST: orchestrator.ingestVirtual({ virtualFiles, metadata })       │
-│     - Préfixe les paths: /virtual/{documentId}/{sourceIdentifier}/       │
+│     - metadata.projectId est utilisé directement (plus de doc-${...})    │
+│     - Préfixe les paths: /virtual/{projectId}/{sourceIdentifier}/        │
 │     - sourceAdapter.parse({ source: { type: 'virtual', virtualFiles }})  │
 │     - Injecte metadata community sur chaque node                         │
 │     - ingestionManager.ingestGraph() → Neo4j                             │
@@ -53,7 +79,8 @@ POST /ingest/github
        │
        ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  5. EMBED: orchestrator.generateEmbeddingsForDocument(documentId)        │
+│  5. EMBED: orchestrator.generateEmbeddingsForProject(projectId)          │
+│     ← RENOMMÉ de generateEmbeddingsForDocument                           │
 └──────────────────────────────────────────────────────────────────────────┘
        │
        ▼
@@ -65,65 +92,8 @@ POST /ingest/github
 **Points clés:**
 - Utilise SSE (Server-Sent Events) pour streaming des progress
 - Fichiers chargés **en mémoire** (virtualFiles), pas de tracking disque
-- `ingestVirtual` utilise `sourceAdapter.parse()` (UniversalSourceAdapter)
-- Metadata community injectée manuellement sur chaque node
-
-### Architecture Documentée (non implémentée dans ragforge-core)
-
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                         MCP Tool: ingest_github                             │
-├────────────────────────────────────────────────────────────────────────────┤
-│  Input:                                                                     │
-│  - url: "owner/repo" ou "https://github.com/owner/repo"                    │
-│  - branch: "main" (default)                                                │
-│  - path: "src/lib" (optionnel, sous-dossier)                              │
-│  - include/exclude: glob patterns                                          │
-│  - include_submodules: true (default)                                      │
-│  - generate_embeddings: true (default)                                     │
-└────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                        BrainManager.ingestGitHub()                          │
-│                                                                             │
-│  1. Clone repo with --depth 1 + submodules                                 │
-│  2. Appeler ingestDirectory() sur le clone                                 │
-│  3. Nettoyage du dossier temporaire                                        │
-└────────────────────────────────────────────────────────────────────────────┘
-```
-
-### UnifiedProcessor (RagForge-Core)
-
-Le UnifiedProcessor utilise un **pipeline basé sur disque** avec FileStateMachine:
-
-```
-discovered → parsing → parsed → linking → linked → entities → embedding → ready
-```
-
-**`processDiscovered()`** (`unified-processor.ts:186-240`):
-```typescript
-// 1. Get files in 'discovered' state from FileStateMachine
-const discoveredFiles = await this.fileStateMachine.getFilesInState(projectId, 'discovered');
-
-// 2. Convert to FileInfo (absolutePath, uuid, state)
-const fileInfos = discoveredFiles.map(f => ({
-  absolutePath: this.resolveAbsolutePath(f.file),
-  uuid: f.uuid,
-  state: 'discovered',
-}));
-
-// 3. Batch process (single adapter.parse() call)
-const batchResult = await this.fileProcessor.processBatchFiles(fileInfos);
-
-// 4. Resolve pending imports (cross-file CONSUMES relationships)
-await resolvePendingImports(this.neo4jClient, this.projectId);
-```
-
-**`processLinked()`** (`unified-processor.ts:245-529`):
-- Entity extraction (GLiNER)
-- Multi-embedding generation (name, content, description)
-- Parallel processing avec `pLimit`
+- `metadata.projectId` est utilisé directement sur tous les nodes Neo4j
+- Plus de transformation `doc-${documentId}` → utilise `projectId` directement
 
 ### Gap: Virtual Files vs Disk Pipeline
 
@@ -134,19 +104,7 @@ await resolvePendingImports(this.neo4jClient, this.projectId);
 | **Incremental** | Non | Oui (hash checking) |
 | **Entity extraction** | Séparé | Intégré |
 | **Embeddings** | Séparé | Intégré |
-
-### Problème Fondamental: UnifiedProcessor et Fichiers Virtuels
-
-**Le problème:**
-- UnifiedProcessor utilise FileStateMachine qui **track les fichiers sur disque**
-- Si le temp dir est supprimé après GitHub clone, au prochain cycle le processor voit les fichiers comme "deleted" et **nettoie la DB**
-- Pas de support pour projets "virtual-only" (fichiers uniquement en Neo4j)
-
-**Cas d'usage critiques:**
-1. **GitHub ingestion** - Clone temporaire, fichiers supprimés après ingestion
-2. **Neo4j Aura** - DB hostée, pas de filesystem local
-3. **Serverless** - Pas de persistance disque
-4. **ZIP uploads** - Fichiers extraits en mémoire seulement
+| **projectId** | ✅ Direct | À adapter |
 
 ### Architecture Cible: Support Fichiers Virtuels
 
@@ -171,369 +129,6 @@ await resolvePendingImports(this.neo4jClient, this.projectId);
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
-
-### Découverte: CodeSourceAdapter supporte déjà les fichiers virtuels
-
-**Bonne nouvelle !** Le parsing fonctionne déjà 100% en mémoire quand on utilise `virtualFiles`:
-
-```typescript
-// code-source-adapter.ts lignes 454-465
-if (config.virtualFiles && config.virtualFiles.length > 0) {
-  // Virtual files mode: use in-memory content
-  console.log(`📦 Virtual files mode: ${config.virtualFiles.length} files in memory`);
-  contentMap = new Map();
-  for (const vf of config.virtualFiles) {
-    const normalizedPath = vf.path.startsWith('/') ? vf.path : `/${vf.path}`;
-    files.push(normalizedPath);
-    contentMap.set(normalizedPath, vf.content);
-  }
-}
-
-// Ligne 717-720: Lecture depuis mémoire
-if (contentMap && contentMap.has(file)) {
-  const virtualContent = contentMap.get(file)!;
-  content = typeof virtualContent === 'string' ? virtualContent : ...
-}
-
-// Ligne 754-757: Passe contentMap aux code parsers (tree-sitter)
-const parsedCode = await this.codeParser.parse({
-  files: Array.from(codeContentMap.keys()),
-  contentMap: codeContentMap,  // Parsers aussi en mémoire!
-});
-```
-
-**Conclusion:** `CodeSourceAdapter` + `@luciformresearch/codeparsers` supportent nativement le parsing en mémoire. Le problème est uniquement dans `FileStateMachine` qui assume l'existence sur disque.
-
-### Architecture Décidée: Abstraction IFileStateMachine
-
-On crée une interface commune + classe de base pour factoriser la logique partagée:
-
-```typescript
-// ============================================
-// Interface commune
-// ============================================
-interface IFileStateMachine {
-  // Queries état
-  getFilesInState(projectId: string, state: FileState): Promise<FileStateInfo[]>;
-  getStateStats(projectId: string): Promise<Record<FileState, number>>;
-  getProgress(projectId: string): Promise<{ processed: number; total: number; percentage: number }>;
-  getRetryableFiles(projectId: string, maxRetries: number): Promise<FileStateInfo[]>;
-  isProjectFullyProcessed(projectId: string): Promise<boolean>;
-
-  // Transitions
-  transition(uuid: string, newState: FileState, options?: TransitionOptions): Promise<void>;
-  transitionBatch(uuids: string[], newState: FileState): Promise<void>;
-
-  // Accès fichiers (différent selon mode)
-  checkFileExists(path: string): Promise<boolean>;
-  getFileContent(path: string): Promise<string | null>;
-  getFileHash(path: string): Promise<string | null>;
-}
-
-// ============================================
-// Classe de base avec logique partagée
-// ============================================
-abstract class BaseFileStateMachine implements IFileStateMachine {
-  protected neo4jClient: Neo4jClient;
-
-  constructor(neo4jClient: Neo4jClient) {
-    this.neo4jClient = neo4jClient;
-  }
-
-  // PARTAGÉ: Validation des transitions
-  protected validateTransition(from: FileState, to: FileState): boolean {
-    const validTransitions: Record<FileState, FileState[]> = {
-      'discovered': ['parsing', 'error'],
-      'parsing': ['linked', 'error'],
-      'linked': ['entities', 'error'],
-      'entities': ['embedding', 'error'],
-      'embedding': ['embedded', 'error'],
-      'embedded': ['discovered'], // Re-process
-      'error': ['discovered'],    // Retry
-    };
-    return validTransitions[from]?.includes(to) ?? false;
-  }
-
-  // PARTAGÉ: Queries Neo4j pour états
-  async getFilesInState(projectId: string, state: FileState): Promise<FileStateInfo[]> {
-    const result = await this.neo4jClient.run(`
-      MATCH (f:File {projectId: $projectId, _state: $state})
-      RETURN f.uuid as uuid, f.file as file, f._state as state,
-             f._errorType as errorType, f._retryCount as retryCount
-    `, { projectId, state });
-    return result.records.map(r => ({ ... }));
-  }
-
-  async transitionBatch(uuids: string[], newState: FileState): Promise<void> {
-    await this.neo4jClient.run(`
-      UNWIND $uuids AS uuid
-      MATCH (f:File {uuid: uuid})
-      SET f._state = $newState, f._stateUpdatedAt = datetime()
-    `, { uuids, newState });
-  }
-
-  async getStateStats(projectId: string): Promise<Record<FileState, number>> { ... }
-  async getProgress(projectId: string): Promise<...> { ... }
-
-  // ABSTRAIT: Implémentation spécifique au mode
-  abstract checkFileExists(path: string): Promise<boolean>;
-  abstract getFileContent(path: string): Promise<string | null>;
-  abstract getFileHash(path: string): Promise<string | null>;
-}
-
-// ============================================
-// Implémentation DISK (actuelle, renommée)
-// ============================================
-class DiskFileStateMachine extends BaseFileStateMachine {
-  async checkFileExists(path: string): Promise<boolean> {
-    try {
-      await fs.access(path);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  async getFileContent(path: string): Promise<string | null> {
-    try {
-      return await fs.readFile(path, 'utf-8');
-    } catch {
-      return null;
-    }
-  }
-
-  async getFileHash(path: string): Promise<string | null> {
-    const content = await this.getFileContent(path);
-    return content ? computeHash(content) : null;
-  }
-}
-
-// ============================================
-// Implémentation VIRTUAL (nouvelle)
-// ============================================
-class VirtualFileStateMachine extends BaseFileStateMachine {
-  async checkFileExists(path: string): Promise<boolean> {
-    // Fichier "existe" s'il y a un node en DB avec _rawContent
-    const result = await this.neo4jClient.run(`
-      MATCH (f:File {absolutePath: $path})
-      WHERE f._rawContent IS NOT NULL
-      RETURN count(f) > 0 as exists
-    `, { path });
-    return result.records[0]?.get('exists') ?? false;
-  }
-
-  async getFileContent(path: string): Promise<string | null> {
-    // Contenu depuis _rawContent en Neo4j
-    const result = await this.neo4jClient.run(`
-      MATCH (f:File {absolutePath: $path})
-      RETURN f._rawContent as content
-    `, { path });
-    return result.records[0]?.get('content') ?? null;
-  }
-
-  async getFileHash(path: string): Promise<string | null> {
-    // Hash depuis _rawContentHash en Neo4j (déjà calculé à l'ingestion)
-    const result = await this.neo4jClient.run(`
-      MATCH (f:File {absolutePath: $path})
-      RETURN f._rawContentHash as hash
-    `, { path });
-    return result.records[0]?.get('hash') ?? null;
-  }
-}
-```
-
-### Utilisation dans UnifiedProcessor
-
-```typescript
-class UnifiedProcessor {
-  private stateMachine: IFileStateMachine;
-
-  constructor(config: UnifiedProcessorConfig) {
-    // Sélection automatique selon projectType
-    this.stateMachine = config.projectType === 'virtual'
-      ? new VirtualFileStateMachine(config.neo4jClient)
-      : new DiskFileStateMachine(config.neo4jClient);
-  }
-
-  // Le reste du code utilise this.stateMachine sans savoir le mode
-  async processDiscovered(): Promise<ProcessingStats> {
-    const files = await this.stateMachine.getFilesInState(this.projectId, 'discovered');
-    // ... même logique pour les deux modes
-  }
-}
-```
-
-### Changements Requis
-
-#### 1. Ajouter `projectType` aux projets
-
-```typescript
-type ProjectType = 'disk' | 'virtual';
-
-interface Project {
-  id: string;
-  path?: string;           // Seulement pour disk
-  virtualRoot?: string;    // Seulement pour virtual
-  type: ProjectType;
-}
-```
-
-#### 2. Refactorer FileStateMachine → BaseFileStateMachine + DiskFileStateMachine
-
-Fichier: `src/brain/file-state-machine.ts`
-- Extraire la logique commune dans `BaseFileStateMachine`
-- Renommer l'implémentation actuelle en `DiskFileStateMachine`
-- Créer `VirtualFileStateMachine`
-
-#### 3. Garantir `_rawContent` sur TOUS les File nodes virtuels
-
-```typescript
-// Dans code-source-adapter.ts ou virtual ingestion
-// OBLIGATOIRE pour fichiers virtuels:
-nodes.push({
-  labels: ['File'],
-  properties: {
-    // ...
-    _rawContent: content,  // TOUJOURS présent pour virtual
-    _rawContentHash: computeHash(content),
-    isVirtual: true,       // Flag pour identifier
-  }
-});
-```
-
-#### 4. Modifier UnifiedProcessor pour supporter les deux modes
-
-```typescript
-class UnifiedProcessor {
-  private fileStateMachine: FileStateMachine | VirtualFileStateMachine;
-  private projectType: ProjectType;
-
-  constructor(config: UnifiedProcessorConfig) {
-    this.projectType = config.projectType ?? 'disk';
-
-    if (this.projectType === 'virtual') {
-      this.fileStateMachine = new VirtualFileStateMachine(config);
-    } else {
-      this.fileStateMachine = new FileStateMachine(config);
-    }
-  }
-
-  async processDiscovered(): Promise<ProcessingStats> {
-    // Le code reste le même, seule la state machine change
-    const discoveredFiles = await this.fileStateMachine.getFilesInState(
-      this.projectId, 'discovered'
-    );
-    // ...
-  }
-}
-```
-
-#### 5. VirtualFileWatcher (optionnel, pour updates)
-
-```typescript
-class VirtualFileWatcher {
-  // Au lieu de chokidar qui watch le filesystem,
-  // expose une API pour signaler les changements:
-
-  async notifyFileChanged(projectId: string, filePath: string, newContent: string) {
-    // 1. Update _rawContent et _rawContentHash
-    // 2. Mark file as 'discovered' pour re-processing
-  }
-
-  async notifyFileDeleted(projectId: string, filePath: string) {
-    // 1. Delete File node et ses enfants
-  }
-
-  async notifyFileCreated(projectId: string, filePath: string, content: string) {
-    // 1. Create File node with _rawContent
-    // 2. Mark as 'discovered'
-  }
-}
-```
-
-### Implémentation GitHub Ingestion (avec virtual)
-
-```typescript
-async ingestGitHub(options: GitHubIngestionOptions): Promise<IngestionStats> {
-  // 1. Clone to temp dir
-  const { tempDir, repoDir } = await cloneGitHubRepo(options.url, options.branch);
-
-  try {
-    // 2. Read ALL files into memory
-    const virtualFiles = await readAllFilesToMemory(repoDir, options.include, options.exclude);
-
-    // 3. Create VIRTUAL project
-    const projectId = `github-${owner}-${repo}`;
-    await this.registerProject({
-      id: projectId,
-      type: 'virtual',
-      virtualRoot: `/github/${owner}/${repo}`,
-    });
-
-    // 4. Use UnifiedProcessor in VIRTUAL mode
-    const processor = new UnifiedProcessor({
-      ...this.config,
-      projectId,
-      projectType: 'virtual',  // <-- KEY
-    });
-
-    // 5. Ingest virtual files (creates File nodes with _rawContent)
-    await this.ingestVirtualFiles(projectId, virtualFiles);
-
-    // 6. Process through pipeline
-    await processor.processDiscovered();
-    await processor.processLinked();
-
-    return stats;
-  } finally {
-    // 7. Cleanup temp dir - DB nodes PERSIST because they're virtual
-    await fs.rm(tempDir, { recursive: true });
-  }
-}
-```
-
-### Actions Requises
-
-1. **Implémenter `generateGitHubIngestionTool()` dans `brain-tools.ts`**
-   - Définition du tool avec schema Zod
-   - Handler qui appelle `BrainManager.ingestGitHub()`
-
-2. **Implémenter `BrainManager.ingestGitHub()` dans `brain-manager.ts`**
-   ```typescript
-   async ingestGitHub(options: {
-     url: string;
-     branch?: string;
-     path?: string;
-     include?: string[];
-     exclude?: string[];
-     includeSubmodules?: boolean;
-     generateEmbeddings?: boolean;
-   }): Promise<IngestionStats> {
-     // 1. Clone to temp dir
-     const { tempDir, repoDir } = await this.cloneGitHubRepo(options.url, options.branch);
-
-     try {
-       // 2. Use existing ingestDirectory (which uses UnifiedProcessor)
-       const targetDir = options.path ? path.join(repoDir, options.path) : repoDir;
-       return await this.ingestDirectory(targetDir, {
-         include: options.include,
-         exclude: options.exclude,
-         generateEmbeddings: options.generateEmbeddings,
-       });
-     } finally {
-       // 3. Cleanup
-       await fs.rm(tempDir, { recursive: true });
-     }
-   }
-   ```
-
-3. **Copier `cloneGitHubRepo()` vers ragforge-core**
-   - Depuis `lib/ragforge/api/server.ts:82-113`
-   - Vers `packages/ragforge-core/src/utils/git-utils.ts`
-
-4. **Support incremental** (optionnel, phase 2)
-   - Stocker le commit SHA du dernier ingest
-   - `git fetch` + diff pour sync
 
 ---
 
@@ -563,94 +158,74 @@ async ingestGitHub(options: GitHubIngestionOptions): Promise<IngestionStats> {
 | Audio/Video | ❌ | Binaire, pas de `_rawContent` |
 | 3D Models (.glb) | ❌ | Binaire, pas de `_rawContent` |
 
-### Code Existant
-
-```typescript
-// packages/ragforge-core/src/ingestion/parser-types.ts
-export const MAX_RAW_CONTENT_SIZE = 100 * 1024; // 100KB
-
-export function getRawContentProp(content: string | undefined | null): string | undefined {
-  if (!content || content.length > MAX_RAW_CONTENT_SIZE) return undefined;
-  return content;
-}
-```
-
-### Utilisation dans CodeSourceAdapter
-
-```typescript
-// code-source-adapter.ts - exemple pour fichiers code
-fileMetadata.set(file, {
-  rawContentHash,
-  mtime,
-  rawContent: getRawContentProp(content),  // ✅ Collecté
-});
-
-// Puis sur le File node:
-nodes.push({
-  labels: ['File'],
-  properties: {
-    // ...
-    ...(rawContent && { _rawContent: rawContent }),  // ✅ Stocké
-  }
-});
-```
-
-### Verdict
-
-**`_rawContent` est correctement implémenté** pour les fichiers texte/code. Les agents peuvent lire les fichiers virtuels via le tool `read_file` qui récupère `_rawContent` du node Neo4j.
+**Verdict**: `_rawContent` est correctement implémenté pour les fichiers texte/code.
 
 ---
 
 ## 3. Délégation Complète vers RagForge-Core
 
-### Architecture Actuelle
+### Architecture Actuelle (MISE À JOUR)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                           COMMUNITY-DOCS                                 │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
-│  ┌─────────────────────────┐    ┌────────────────────────────────────┐  │
-│  │ CommunityUploadAdapter  │    │ CommunityOrchestratorAdapter       │  │
-│  │ (lib/ragforge/upload-   │    │ (lib/ragforge/orchestrator-        │  │
-│  │  adapter.ts)            │    │  adapter.ts)                       │  │
-│  │                         │    │                                    │  │
-│  │ • parse()               │    │ • ingest() - fichiers disque       │  │
-│  │ • parseFile()           │    │ • ingestVirtual() - fichiers mém   │  │
-│  │ • parseDirectory()      │    │ • ingestFiles() - unifié           │  │
-│  └───────────┬─────────────┘    └──────────────┬─────────────────────┘  │
-│              │                                  │                        │
-│              │         DÉLÈGUE À                │                        │
-│              ▼                                  ▼                        │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │                    PRISMA (PostgreSQL)                             │  │
+│  │  • Project { id, name, searchReady, ... }                         │  │
+│  │  • Document { id, projectId, title, ... }                         │  │
+│  │  • User, Category, etc.                                           │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                           │
+│                              │ projectId                                │
+│                              ▼                                           │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │ CommunityOrchestratorAdapter                                       │  │
+│  │ (lib/ragforge/orchestrator-adapter.ts)                             │  │
+│  │                                                                    │  │
+│  │ • ingest() - fichiers disque                                       │  │
+│  │ • ingestVirtual() - fichiers mémoire                              │  │
+│  │ • ingestFiles() - unifié (dispatch auto)                          │  │
+│  │ • generateEmbeddingsForProject(projectId) ← RENOMMÉ               │  │
+│  │ • deleteProjectNodes(projectId) ← NOUVEAU                         │  │
+│  │                                                                    │  │
+│  │ → Tous les nodes reçoivent metadata.projectId directement         │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+│                              │                                           │
+│                              │ DÉLÈGUE À                                │
+│                              ▼                                           │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                           RAGFORGE-CORE                                  │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │              UniversalSourceAdapter                              │    │
-│  │              (src/runtime/adapters/universal-source-adapter.ts)  │    │
-│  │                                                                  │    │
-│  │  • parse({ source: { type: 'files' | 'virtual', ... } })        │    │
-│  │  • Dispatche vers CodeSourceAdapter, WebAdapter, etc.           │    │
-│  └──────────────────────────────────────────────────────────────────┘   │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │              UniversalSourceAdapter                                │  │
+│  │              (src/runtime/adapters/universal-source-adapter.ts)    │  │
+│  │                                                                    │  │
+│  │  • parse({ source: { type: 'files' | 'virtual', ... } })          │  │
+│  │  • Dispatche vers CodeSourceAdapter, WebAdapter, etc.             │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
-│  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │              CodeSourceAdapter                                   │    │
-│  │              (src/runtime/adapters/code-source-adapter.ts)       │    │
-│  │                                                                  │    │
-│  │  • parseFiles() - gère virtualFiles nativement                  │    │
-│  │  • Supporte: code, markdown, data, media, documents             │    │
-│  │  • Ajoute _rawContent sur les File nodes                        │    │
-│  └──────────────────────────────────────────────────────────────────┘   │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │              CodeSourceAdapter                                     │  │
+│  │              (src/runtime/adapters/code-source-adapter.ts)         │  │
+│  │                                                                    │  │
+│  │  • parseFiles() - gère virtualFiles nativement                    │  │
+│  │  • Supporte: code, markdown, data, media, documents               │  │
+│  │  • Ajoute _rawContent sur les File nodes                          │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Ce Qui Fonctionne Déjà
 
-1. **`CommunityUploadAdapter.parse()`** → délègue à `UniversalSourceAdapter.parse()`
-2. **`CommunityOrchestratorAdapter.ingestVirtual()`** → utilise `UniversalSourceAdapter` avec `source.type = 'virtual'`
-3. **Virtual files** → supportés nativement par `CodeSourceAdapter.parseFiles()`
+1. ✅ `CommunityOrchestratorAdapter.ingestVirtual()` → délègue à `UniversalSourceAdapter`
+2. ✅ Virtual files supportés nativement par `CodeSourceAdapter.parseFiles()`
+3. ✅ `metadata.projectId` propagé sur tous les nodes Neo4j
+4. ✅ `generateEmbeddingsForProject(projectId)` utilise le projectId directement
+5. ✅ `deleteProjectNodes(projectId)` pour supprimer tous les nodes d'un projet
 
 ### Ce Qui Doit Être Unifié
 
@@ -659,108 +234,132 @@ nodes.push({
 | Upload ZIP | `CommunityIngestionService` | ❌ Pas de support | Ajouter support ZIP dans core |
 | GitHub Clone | `CommunityAPIServer` | ❌ Pas de support | Implémenter dans BrainManager |
 | Metadata injection | `transformGraph` hook | ❌ Pas de mécanisme | Ajouter callback/hook |
-
-### Plan d'Unification
-
-#### Phase 1: GitHub Ingestion dans RagForge-Core
-
-```typescript
-// brain-manager.ts
-async ingestGitHub(options: GitHubIngestionOptions): Promise<IngestionStats> {
-  const tmpDir = await this.cloneRepository(options.url, options.branch);
-  try {
-    return await this.ingestDirectory(tmpDir, {
-      include: options.include,
-      exclude: options.exclude,
-      generateEmbeddings: options.generateEmbeddings,
-    });
-  } finally {
-    await fs.rm(tmpDir, { recursive: true });
-  }
-}
-```
-
-#### Phase 2: ZIP Support dans RagForge-Core
-
-```typescript
-// Option A: Dans BrainManager
-async ingestZip(zipBuffer: Buffer, options: ZipIngestionOptions): Promise<IngestionStats> {
-  // Extraire en mémoire → VirtualFile[]
-  const virtualFiles = await extractZipToVirtualFiles(zipBuffer);
-  return this.adapter.parse({
-    source: { type: 'virtual', virtualFiles, root: options.rootPath },
-    projectId: options.projectId,
-  });
-}
-
-// Option B: Dans UniversalSourceAdapter (nouveau source type)
-source: { type: 'zip', buffer: zipBuffer, root: '/upload' }
-```
-
-#### Phase 3: Metadata Hook dans RagForge-Core
-
-```typescript
-// brain-manager.ts ou adapter config
-interface IngestionHooks {
-  transformNode?: (node: ParsedNode) => ParsedNode;
-  transformGraph?: (graph: ParseResult) => ParseResult;
-}
-```
+| Project CRUD | ✅ Prisma | N/A | Déjà fait |
 
 ---
 
-## 4. Résumé des Actions
+## 4. CommunityNodeMetadata (MISE À JOUR)
 
-### Priorité Haute
+### Avant (OLD)
+
+```typescript
+interface CommunityNodeMetadata {
+  documentId: string;  // ← Était required
+  // projectId calculé comme doc-${documentId}
+  ...
+}
+```
+
+### Après (NEW)
+
+```typescript
+interface CommunityNodeMetadata {
+  projectId: string;   // ← REQUIRED (Prisma Project.id)
+  documentId?: string; // ← OPTIONAL (pour traçabilité source)
+  documentTitle: string;
+  userId: string;
+  categoryId: string;
+  categorySlug: string;
+  // ...
+}
+```
+
+### Impact sur le Code
+
+| Fichier | Changement |
+|---------|------------|
+| `orchestrator-adapter.ts` | Plus de `doc-${documentId}`, utilise `metadata.projectId` |
+| `api/server.ts` | Toutes les routes passent `projectId` dans metadata |
+| `agent/tools.ts` | `ToolContext.projectId` utilisé pour les tools |
+| `ingestion-service.ts` | `generateEmbeddingsForProject(metadata.projectId)` |
+| `api-client.ts` | `buildNodeMetadata()` requiert `projectId` |
+
+---
+
+## 5. Résumé des Actions
+
+### FAIT ✅
+
+| # | Action | Fichier |
+|---|--------|---------|
+| 1 | Model `Project` Prisma | `prisma/schema.prisma` |
+| 2 | CRUD `/api/projects` | `app/api/projects/*` |
+| 3 | `projectId` required dans metadata | `lib/ragforge/types.ts` |
+| 4 | Supprimer pattern `doc-${documentId}` | `lib/ragforge/orchestrator-adapter.ts` |
+| 5 | Renommer `generateEmbeddingsForDocument` → `generateEmbeddingsForProject` | Multiple fichiers |
+| 6 | `deleteProject(projectId)` | `neo4j-client.ts`, `api-client.ts`, `server.ts` |
+| 7 | Route `DELETE /project/:projectId` | `lib/ragforge/api/server.ts` |
+
+### À FAIRE - Priorité Haute
 
 | # | Action | Fichier | Effort |
 |---|--------|---------|--------|
 | 1 | Implémenter `ingest_github` MCP tool | `brain-tools.ts` | 2h |
 | 2 | Implémenter `BrainManager.ingestGitHub()` | `brain-manager.ts` | 4h |
+| 3 | Routes project-scoped: `/api/projects/:id/search` | `app/api/projects/[id]/search` | 3h |
+| 4 | Routes project-scoped: `/api/projects/:id/chat` | `app/api/projects/[id]/chat` | 3h |
 
-### Priorité Moyenne
-
-| # | Action | Fichier | Effort |
-|---|--------|---------|--------|
-| 3 | Ajouter support ZIP dans core | `brain-manager.ts` ou nouveau fichier | 4h |
-| 4 | Ajouter hooks metadata | `brain-manager.ts` | 2h |
-
-### Priorité Basse (optionnel)
+### À FAIRE - Priorité Moyenne
 
 | # | Action | Fichier | Effort |
 |---|--------|---------|--------|
-| 5 | Incremental GitHub sync | `brain-manager.ts` | 8h |
-| 6 | Migrer community-docs vers appels core uniquement | `orchestrator-adapter.ts` | 4h |
+| 5 | Ajouter support ZIP dans core | `brain-manager.ts` | 4h |
+| 6 | Progress tracking `embeddingProgress` | `orchestrator-adapter.ts` | 2h |
+| 7 | UI Project selector | `components/` | 4h |
+
+### À FAIRE - Priorité Basse (optionnel)
+
+| # | Action | Fichier | Effort |
+|---|--------|---------|--------|
+| 8 | Incremental GitHub sync | `brain-manager.ts` | 8h |
+| 9 | `VirtualFileStateMachine` | `packages/ragforge-core` | 6h |
+| 10 | Migration script pour projets existants | `scripts/` | 2h |
 
 ---
 
-## 5. Références Code
-
-### Fichiers Clés - RagForge-Core
-
-- `src/tools/brain-tools.ts` - Tools MCP
-- `src/brain/brain-manager.ts` - Orchestration principale
-- `src/runtime/adapters/universal-source-adapter.ts` - Dispatcher
-- `src/runtime/adapters/code-source-adapter.ts` - Parsing code
-- `src/runtime/adapters/types.ts` - Interface `VirtualFile`
-- `src/ingestion/parser-types.ts` - `getRawContentProp`, `MAX_RAW_CONTENT_SIZE`
+## 6. Références Code
 
 ### Fichiers Clés - Community-Docs
 
-- `lib/ragforge/orchestrator-adapter.ts` - `CommunityOrchestratorAdapter`
-- `lib/ragforge/upload-adapter.ts` - `CommunityUploadAdapter`
-- `lib/ragforge/ingestion-service.ts` - `CommunityIngestionService`
-- `lib/ragforge/api/server.ts` - `cloneGitHubRepo()`
-- `app/api/ingest/github` - API endpoint
+| Fichier | Description |
+|---------|-------------|
+| `prisma/schema.prisma` | Model `Project` + enum `SearchCapability` |
+| `app/api/projects/route.ts` | CRUD list + create |
+| `app/api/projects/[id]/route.ts` | CRUD get + update + delete |
+| `lib/ragforge/types.ts` | `CommunityNodeMetadata` avec `projectId` required |
+| `lib/ragforge/orchestrator-adapter.ts` | `generateEmbeddingsForProject()`, `deleteProjectNodes()` |
+| `lib/ragforge/api-client.ts` | HTTP client, `deleteProject()` |
+| `lib/ragforge/api/server.ts` | API server (port 6970), route delete |
+| `lib/ragforge/neo4j-client.ts` | `deleteProject(projectId)` |
+| `lib/ragforge/agent/tools.ts` | `ToolContext.projectId`, tools avec metadata |
+| `lib/ragforge/ingestion-service.ts` | Service d'ingestion |
+
+### Fichiers Clés - RagForge-Core
+
+| Fichier | Description |
+|---------|-------------|
+| `src/tools/brain-tools.ts` | Tools MCP (GitHub à implémenter) |
+| `src/brain/brain-manager.ts` | Orchestration principale |
+| `src/runtime/adapters/universal-source-adapter.ts` | Dispatcher |
+| `src/runtime/adapters/code-source-adapter.ts` | Parsing code + virtualFiles |
+| `src/runtime/adapters/types.ts` | Interface `VirtualFile` |
+| `src/ingestion/parser-types.ts` | `getRawContentProp`, `MAX_RAW_CONTENT_SIZE` |
 
 ---
 
-## 6. Conclusion
+## 7. Conclusion
 
-**L'unification est bien avancée** - community-docs délègue déjà le parsing à ragforge-core via `UniversalSourceAdapter`. Les points manquants sont:
+**L'unification progresse bien:**
 
-1. **GitHub ingestion** - Documenté mais non implémenté dans les MCP tools
-2. **ZIP support** - Géré côté community-docs, devrait être dans core
-3. **Metadata hooks** - Community-docs utilise `transformGraph`, core n'a pas d'équivalent
+1. ✅ **Architecture Prisma + Neo4j** - Projects en Prisma, knowledge graph en Neo4j
+2. ✅ **`projectId` comme identifiant principal** - Plus de transformation `doc-${documentId}`
+3. ✅ **CRUD Projects complet** - API routes fonctionnelles
+4. ✅ **Delete cascade** - Project → tous les nodes Neo4j
+5. ✅ **Metadata cohérente** - `projectId` required partout
 
-**`_rawContent` est correctement géré** pour tous les types de fichiers texte, permettant aux agents de lire les fichiers virtuels.
+**Prochaines étapes:**
+
+1. Routes project-scoped (`/api/projects/:id/search`, `/api/projects/:id/chat`)
+2. GitHub ingestion dans ragforge-core MCP tools
+3. Progress tracking pour les embeddings
+4. UI Project selector

@@ -11,6 +11,7 @@ import neo4j, { Driver, Session, QueryResult } from "neo4j-driver";
 import {
   ensureBaseIndexes,
   ensureFulltextIndexes,
+  ensureVectorIndexesCentralized,
 } from "@luciformresearch/ragforge";
 
 export interface Neo4jClientConfig {
@@ -196,6 +197,28 @@ export class Neo4jClient {
   }
 
   /**
+   * Delete all nodes for a project
+   * This deletes all File, Scope, Entity nodes with matching projectId
+   */
+  async deleteProject(projectId: string): Promise<number> {
+    // First count, then delete (Neo4j doesn't allow count after DELETE)
+    const countResult = await this.run(
+      `MATCH (n {projectId: $projectId}) RETURN count(n) AS cnt`,
+      { projectId }
+    );
+    const count = countResult.records[0]?.get("cnt")?.toNumber() || 0;
+
+    if (count > 0) {
+      await this.run(
+        `MATCH (n {projectId: $projectId}) DETACH DELETE n`,
+        { projectId }
+      );
+    }
+
+    return count;
+  }
+
+  /**
    * Update metadata for all nodes of a document
    */
   async updateDocumentMetadata(
@@ -254,6 +277,18 @@ export class Neo4jClient {
         // Index might already exist, ignore
       }
     }
+  }
+
+  /**
+   * Ensure vector indexes with specific dimension
+   *
+   * Call this AFTER determining the embedding provider dimension:
+   * - TEI: 768
+   * - Ollama mxbai-embed-large: 1024
+   * - Gemini: 3072
+   */
+  async ensureVectorIndexes(dimension: number): Promise<void> {
+    await ensureVectorIndexesCentralized(this as any, { dimension, verbose: true });
   }
 
   /**

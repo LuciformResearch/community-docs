@@ -78,6 +78,7 @@ export type {
 } from "./upload-adapter";
 
 // Orchestrator Adapter (uses IngestionOrchestrator with transformGraph hook)
+// @deprecated Use createCommunityIngester() for new integrations
 export {
   CommunityOrchestratorAdapter,
   getCommunityOrchestrator,
@@ -91,6 +92,14 @@ export type {
   CommunitySearchResult,
   CommunitySearchResultSet,
 } from "./orchestrator-adapter";
+
+// NEW: Simplified Community Ingester (recommended for new integrations)
+export {
+  createCommunityIngester,
+  type CommunityIngester,
+  type CommunityMetadata,
+  type CommunityIngesterConfig,
+} from "./community-ingester";
 
 // Re-export post-processing types from @ragforge/core (for convenience)
 export type {

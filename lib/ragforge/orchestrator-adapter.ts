@@ -28,12 +28,14 @@ import {
   rerankSearchResults,
   // Markdown formatter
   formatAsMarkdown,
-  // Parsers for binary files
-  documentParser,
-  mediaParser,
   // Entity extraction (GLiNER)
   EntityExtractionClient,
   createEntityExtractionTransform,
+  // NEW: Virtual file ingestion utilities
+  UnifiedProcessor,
+  downloadGitHubRepo,
+  extractZipToVirtualFiles,
+  createVirtualFileFromContent,
   type OrchestratorDependencies,
   type FileChange,
   type IngestionStats,
@@ -51,11 +53,13 @@ import {
   // Formatter types
   type BrainSearchOutput,
   type FormatOptions,
-  // Document parse options
-  type DocumentParseOptions,
-  type MediaParseOptions,
+  // Parser options for Vision, etc.
+  type ParserOptionsConfig,
   // Entity extraction types
   type EntityExtractionConfig,
+  type ProcessingStats,
+  type GitHubDownloadOptions,
+  type ZipExtractOptions,
 } from "@luciformresearch/ragforge";
 import type { Neo4jClient } from "./neo4j-client";
 import type { CommunityNodeMetadata } from "./types";
@@ -114,11 +118,13 @@ export interface CommunityIngestionOptions {
 export interface CommunitySearchOptions {
   /** Search query */
   query: string;
+  /** Filter by project ID (Prisma Project.id) */
+  projectId?: string;
   /** Filter by category slug */
   categorySlug?: string;
   /** Filter by user ID */
   userId?: string;
-  /** Filter by document ID */
+  /** Filter by document ID (source within project) */
   documentId?: string;
   /** Filter by public status */
   isPublic?: boolean;
@@ -304,8 +310,10 @@ export interface UnifiedIngestionOptions {
   }>;
   /** Community metadata to inject on all nodes */
   metadata: CommunityNodeMetadata;
-  /** Document ID (used for projectId = `doc-${documentId}`) */
-  documentId: string;
+  /** Project ID (Prisma Project.id) - required for scoping nodes */
+  projectId: string;
+  /** Document ID (Prisma Document.id) - for source tracking within project */
+  documentId?: string;
   /** Enable Vision-based parsing for PDFs and image analysis (default: false) */
   enableVision?: boolean;
   /** Vision analyzer function for image descriptions (required if enableVision is true for images) */
@@ -491,15 +499,16 @@ export class CommunityOrchestratorAdapter {
         }
 
         const metadata = this.currentMetadata;
-        const projectId = `doc-${metadata.documentId}`;
-        logger.info(`Injecting community metadata on ${graph.nodes.length} nodes`);
+        logger.info(`Injecting community metadata on ${graph.nodes.length} nodes (projectId: ${metadata.projectId})`);
 
         // Inject metadata on all nodes
         for (const node of graph.nodes) {
           // IMPORTANT: projectId is required for EmbeddingService to find nodes
-          node.properties.projectId = projectId;
-          // Document identity
-          node.properties.documentId = metadata.documentId;
+          node.properties.projectId = metadata.projectId;
+          // Document/Source identity (optional, for tracking which source within project)
+          if (metadata.documentId) {
+            node.properties.documentId = metadata.documentId;
+          }
           node.properties.documentTitle = metadata.documentTitle;
 
           // User info
@@ -573,7 +582,7 @@ export class CommunityOrchestratorAdapter {
 
               const entityTransform = createEntityExtractionTransform({
                 ...this.entityExtractionClient.getConfig(),
-                projectId, // Pass projectId so Entity nodes get correct project assignment
+                projectId: metadata.projectId, // Pass projectId so Entity nodes get correct project assignment
                 verbose: this.verbose,
                 deduplication: {
                   strategy: 'hybrid',
@@ -635,191 +644,476 @@ export class CommunityOrchestratorAdapter {
     logger.info("[CommunityOrchestrator] EntityEmbeddingService set for entity boost");
   }
 
+  // ==========================================================================
+  // NEW: Simplified Ingestion Methods using RagForge Core UnifiedProcessor
+  // ==========================================================================
+
   /**
-   * Ingest files with community metadata
+   * Create the :Project node in Neo4j for a Prisma project.
+   * Call this after creating the project in Prisma.
+   *
+   * @param projectId - Prisma Project.id (will be used as projectId in Neo4j)
    */
-  async ingest(options: CommunityIngestionOptions): Promise<IngestionStats> {
-    await this.initialize();
-
-    const {
-      files,
-      metadata,
-      projectId = `doc-${metadata.documentId}`,
-      generateEmbeddings = false,
-    } = options;
-
-    // Set current metadata for transformGraph hook
-    this.currentMetadata = metadata;
-
-    try {
-      // Convert to FileChange array
-      const changes: FileChange[] = files.map((f) => ({
-        path: f.path,
-        changeType: f.changeType || "created",
-        projectId,
-      }));
-
-      logger.info(`Ingesting ${files.length} files for document: ${metadata.documentId}`);
-
-      // Use orchestrator's reingest method
-      const stats = await this.orchestrator!.reingest(changes, {
-        projectId,
-        generateEmbeddings,
-        verbose: this.verbose,
-      });
-
-      logger.info(
-        `Ingestion complete: ${stats.nodesCreated} nodes, ${stats.created} created, ${stats.updated} updated`
-      );
-
-      return stats;
-    } finally {
-      // Clear metadata after ingestion
-      this.currentMetadata = null;
-    }
+  async createProjectInNeo4j(projectId: string): Promise<void> {
+    await this.neo4j.run(`
+      MERGE (p:Project {projectId: $projectId})
+      SET p.rootPath = '/virtual/' + $projectId,
+          p.type = 'external',
+          p.contentSourceType = 'virtual',
+          p.createdAt = datetime()
+    `, { projectId });
+    logger.info(`[CommunityOrchestrator] Created :Project node in Neo4j: ${projectId}`);
   }
 
   /**
-   * Ingest virtual files (in-memory) with community metadata.
-   * No disk I/O - ideal for scalable/serverless deployments.
-   *
-   * @example
-   * await adapter.ingestVirtual({
-   *   virtualFiles: [
-   *     { path: "/docs/api.ts", content: fileBuffer }
-   *   ],
-   *   metadata: { documentId: "123", ... }
-   * });
+   * Create a UnifiedProcessor for a project (virtual mode).
+   * Uses the existing coreClient from initialize().
    */
-  async ingestVirtual(
-    options: CommunityVirtualIngestionOptions
-  ): Promise<{ nodesCreated: number; relationshipsCreated: number }> {
+  private async getUnifiedProcessor(projectId: string): Promise<UnifiedProcessor> {
     await this.initialize();
 
-    const {
-      virtualFiles,
-      metadata,
-      sourceIdentifier = "upload",
-      projectId = `doc-${metadata.documentId}`,
-      onProgress,
-    } = options;
-
-    // Build virtual root prefix: /virtual/{documentId}/{sourceIdentifier}
-    const virtualRoot = `/virtual/${metadata.documentId}/${sourceIdentifier}`;
-
-    // Set current metadata for transformGraph hook
-    this.currentMetadata = metadata;
-
-    try {
-      logger.info(
-        `Ingesting ${virtualFiles.length} virtual files for document: ${metadata.documentId}`
-      );
-      logger.info(`Virtual root: ${virtualRoot}`);
-
-      // Report parsing start
-      onProgress?.("parsing", 0, virtualFiles.length, "Parsing files...");
-
-      // Prefix all file paths with virtual root
-      const prefixedFiles = virtualFiles.map((f) => {
-        // Normalize path: remove leading slash if present
-        const normalizedPath = f.path.startsWith("/") ? f.path.slice(1) : f.path;
-        return {
-          path: `${virtualRoot}/${normalizedPath}`,
-          content: f.content,
-        };
-      });
-
-      // Parse virtual files directly (no disk I/O)
-      const result = await this.sourceAdapter.parse({
-        source: {
-          type: "virtual",
-          virtualFiles: prefixedFiles,
-        },
-        projectId,
-      });
-
-      // Report parsing complete
-      onProgress?.("parsing", virtualFiles.length, virtualFiles.length, `Parsed ${result.graph.nodes.length} nodes`);
-
-      // Apply transformGraph hook to inject community metadata
-      let graph = {
-        nodes: result.graph.nodes,
-        relationships: result.graph.relationships,
-        metadata: {
-          filesProcessed: result.graph.metadata.filesProcessed,
-          nodesGenerated: result.graph.metadata.nodesGenerated,
-        },
-      };
-
-      // Inject community metadata on all nodes
-      // Pattern to detect binary documents converted to markdown (e.g., file.pdf.md, file.docx.md)
-      const binaryDocPattern = /\.(pdf|docx|doc|xlsx|xls|odt|rtf)\.md$/i;
-
-      for (const node of graph.nodes) {
-        // IMPORTANT: projectId is required for EmbeddingService to find nodes
-        node.properties.projectId = projectId;
-        node.properties.documentId = metadata.documentId;
-        node.properties.documentTitle = metadata.documentTitle;
-        node.properties.userId = metadata.userId;
-        if (metadata.userUsername) {
-          node.properties.userUsername = metadata.userUsername;
-        }
-        node.properties.categoryId = metadata.categoryId;
-        node.properties.categorySlug = metadata.categorySlug;
-        if (metadata.categoryName) {
-          node.properties.categoryName = metadata.categoryName;
-        }
-        if (metadata.isPublic !== undefined) {
-          node.properties.isPublic = metadata.isPublic;
-        }
-        if (metadata.tags && metadata.tags.length > 0) {
-          node.properties.tags = metadata.tags;
-        }
-        node.properties.sourceType = "community-upload";
-
-        // Extract originalFileName and sourceFormat for binary documents converted to markdown
-        // e.g., file.pdf.md -> file.pdf (originalFileName), pdf (sourceFormat)
-        const filePath = node.properties.file as string | undefined;
-        if (filePath && binaryDocPattern.test(filePath)) {
-          // Remove the .md extension to get the original filename
-          const originalFileName = filePath.replace(/\.md$/, '').split('/').pop();
-          if (originalFileName) {
-            node.properties.originalFileName = originalFileName;
-            // Extract format from extension: file.pdf -> pdf, report.docx -> docx
-            const formatMatch = originalFileName.match(/\.(\w+)$/);
-            if (formatMatch) {
-              node.properties.sourceFormat = formatMatch[1].toLowerCase();
-            }
-          }
-        }
-      }
-
-      logger.info(`Injected community metadata on ${graph.nodes.length} nodes`);
-
-      // Report nodes phase starting
-      onProgress?.("nodes", 0, graph.nodes.length, "Creating nodes in Neo4j...");
-
-      // Ingest graph into Neo4j with progress callback
-      await this.ingestionManager!.ingestGraph(
-        { nodes: graph.nodes, relationships: graph.relationships },
-        { projectId, markDirty: true, onProgress }
-      );
-
-      logger.info(
-        `Virtual ingestion complete: ${graph.nodes.length} nodes, ${graph.relationships.length} relationships`
-      );
-
-      // NOTE: Reference linking (REFERENCES, LINKS_TO, REFERENCES_IMAGE) is already done
-      // during parsing in code-source-adapter.ts. No post-processing needed!
-
-      return {
-        nodesCreated: graph.nodes.length,
-        relationshipsCreated: graph.relationships.length,
-      };
-    } finally {
-      // Clear metadata after ingestion
-      this.currentMetadata = null;
+    if (!this.coreClient) {
+      throw new Error("Core client not initialized");
     }
+
+    return new UnifiedProcessor({
+      driver: this.coreClient.getDriver(),
+      neo4jClient: this.coreClient,
+      projectId,
+      contentSourceType: "virtual",
+      verbose: this.verbose,
+      embeddingService: this.embeddingService ?? undefined,
+      glinerServiceUrl: this.entityExtractionEnabled ? "http://localhost:6971" : undefined,
+    });
+  }
+
+  /**
+   * Ingest a GitHub repository using Core utilities.
+   *
+   * This is the NEW simplified method that:
+   * 1. Downloads repo with downloadGitHubRepo()
+   * 2. Ingests with UnifiedProcessor.ingestVirtualFiles()
+   * 3. Propagates community metadata to all nodes
+   *
+   * @param url - GitHub repository URL
+   * @param projectId - Prisma Project.id
+   * @param metadata - Community metadata to inject on all nodes
+   * @param options - GitHub download options
+   */
+  async ingestGitHubSimplified(
+    url: string,
+    projectId: string,
+    metadata: CommunityNodeMetadata,
+    options?: GitHubDownloadOptions
+  ): Promise<ProcessingStats> {
+    logger.info(`[CommunityOrchestrator] Ingesting GitHub repo: ${url} into project: ${projectId}`);
+
+    // 1. Download repository
+    const { files, metadata: repoMetadata, warnings } = await downloadGitHubRepo(url, {
+      method: options?.method ?? "git",
+      includeSubmodules: options?.includeSubmodules ?? true,
+      token: options?.token,
+      exclude: options?.exclude,
+      include: options?.include,
+      maxFileSize: options?.maxFileSize,
+    });
+
+    logger.info(`[CommunityOrchestrator] Downloaded ${files.length} files from ${repoMetadata.owner}/${repoMetadata.repo}`);
+    if (warnings.length > 0) {
+      logger.warn(`[CommunityOrchestrator] Warnings: ${warnings.join(", ")}`);
+    }
+
+    // 2. Get processor
+    const processor = await this.getUnifiedProcessor(projectId);
+
+    // 3. Ingest with metadata
+    const stats = await processor.ingestVirtualFiles(files, {
+      additionalProperties: {
+        projectId,
+        documentId: metadata.documentId,
+        documentTitle: metadata.documentTitle ?? `${repoMetadata.owner}/${repoMetadata.repo}`,
+        userId: metadata.userId,
+        userUsername: metadata.userUsername,
+        categoryId: metadata.categoryId,
+        categorySlug: metadata.categorySlug,
+        categoryName: metadata.categoryName,
+        isPublic: metadata.isPublic,
+        tags: metadata.tags,
+        sourceType: "github",
+        sourceUrl: url,
+      },
+    });
+
+    logger.info(`[CommunityOrchestrator] GitHub ingestion complete: ${stats.filesProcessed} files, ${stats.scopesCreated} scopes`);
+    return stats;
+  }
+
+  /**
+   * Ingest a ZIP archive using Core utilities.
+   *
+   * @param zipBuffer - ZIP file content as Buffer
+   * @param projectId - Prisma Project.id
+   * @param metadata - Community metadata to inject on all nodes
+   * @param options - ZIP extraction options
+   */
+  async ingestZipSimplified(
+    zipBuffer: Buffer,
+    projectId: string,
+    metadata: CommunityNodeMetadata,
+    options?: ZipExtractOptions
+  ): Promise<ProcessingStats> {
+    logger.info(`[CommunityOrchestrator] Ingesting ZIP into project: ${projectId}`);
+
+    // 1. Extract ZIP
+    const { files, metadata: zipMetadata, warnings } = await extractZipToVirtualFiles(zipBuffer, options);
+
+    logger.info(`[CommunityOrchestrator] Extracted ${files.length} files from ZIP`);
+    if (warnings.length > 0) {
+      logger.warn(`[CommunityOrchestrator] Warnings: ${warnings.join(", ")}`);
+    }
+
+    // 2. Get processor
+    const processor = await this.getUnifiedProcessor(projectId);
+
+    // 3. Ingest with metadata
+    const stats = await processor.ingestVirtualFiles(files, {
+      additionalProperties: {
+        projectId,
+        documentId: metadata.documentId,
+        documentTitle: metadata.documentTitle ?? "ZIP Upload",
+        userId: metadata.userId,
+        userUsername: metadata.userUsername,
+        categoryId: metadata.categoryId,
+        categorySlug: metadata.categorySlug,
+        categoryName: metadata.categoryName,
+        isPublic: metadata.isPublic,
+        tags: metadata.tags,
+        sourceType: "zip",
+      },
+    });
+
+    logger.info(`[CommunityOrchestrator] ZIP ingestion complete: ${stats.filesProcessed} files, ${stats.scopesCreated} scopes`);
+    return stats;
+  }
+
+  /**
+   * Ingest a single document/file using Core utilities.
+   *
+   * Note: For binary documents (PDF, DOCX) and media files (images, 3D),
+   * use the existing ingestBinaryDocument() and ingestMedia() methods
+   * which have specialized parsing logic.
+   *
+   * This method is for text files (code, markdown, etc.).
+   *
+   * @param content - File content as Buffer or string
+   * @param fileName - File name with extension
+   * @param projectId - Prisma Project.id
+   * @param metadata - Community metadata to inject on all nodes
+   */
+  async ingestDocumentSimplified(
+    content: Buffer | string,
+    fileName: string,
+    projectId: string,
+    metadata: CommunityNodeMetadata
+  ): Promise<ProcessingStats> {
+    logger.info(`[CommunityOrchestrator] Ingesting document: ${fileName} into project: ${projectId}`);
+
+    // 1. Create virtual file
+    const file = createVirtualFileFromContent(content, fileName);
+
+    // 2. Get processor
+    const processor = await this.getUnifiedProcessor(projectId);
+
+    // 3. Ingest with metadata
+    const stats = await processor.ingestVirtualFiles([file], {
+      additionalProperties: {
+        projectId,
+        documentId: metadata.documentId,
+        documentTitle: metadata.documentTitle ?? fileName,
+        userId: metadata.userId,
+        userUsername: metadata.userUsername,
+        categoryId: metadata.categoryId,
+        categorySlug: metadata.categorySlug,
+        categoryName: metadata.categoryName,
+        isPublic: metadata.isPublic,
+        tags: metadata.tags,
+        sourceType: "upload",
+      },
+    });
+
+    logger.info(`[CommunityOrchestrator] Document ingestion complete: ${stats.filesProcessed} files, ${stats.scopesCreated} scopes`);
+    return stats;
+  }
+
+  /**
+   * Ingest a binary document (PDF, DOCX, etc.) using Core UnifiedProcessor with parserOptions.
+   *
+   * This is the NEW simplified method that:
+   * 1. Creates a VirtualFile from the buffer
+   * 2. Uses UnifiedProcessor.ingestVirtualFiles() with parserOptions for Vision, etc.
+   * 3. Propagates community metadata via additionalProperties
+   *
+   * Use this for Vision-enabled parsing of PDFs and documents.
+   *
+   * @param buffer - Binary content of the file
+   * @param fileName - File name with extension (e.g., "paper.pdf")
+   * @param projectId - Prisma Project.id
+   * @param metadata - Community metadata to inject on all nodes
+   * @param options - Parser options (enableVision, visionAnalyzer, etc.)
+   */
+  async ingestBinaryDocumentSimplified(
+    buffer: Buffer,
+    fileName: string,
+    projectId: string,
+    metadata: CommunityNodeMetadata,
+    options?: {
+      enableVision?: boolean;
+      visionAnalyzer?: (imageBuffer: Buffer, prompt?: string) => Promise<string>;
+      sectionTitles?: 'none' | 'detect' | 'llm';
+      maxPages?: number;
+      generateTitles?: boolean;
+      titleGenerator?: (sections: Array<{ index: number; content: string }>) => Promise<Array<{ index: number; title: string }>>;
+    }
+  ): Promise<ProcessingStats> {
+    logger.info(`[CommunityOrchestrator] Ingesting binary document (simplified): ${fileName} into project: ${projectId}`);
+
+    // 1. Create virtual file
+    const file = createVirtualFileFromContent(buffer, fileName);
+
+    // 2. Get processor
+    const processor = await this.getUnifiedProcessor(projectId);
+
+    // 3. Build parserOptions
+    const parserOptions: ParserOptionsConfig = {
+      enableVision: options?.enableVision,
+      visionAnalyzer: options?.visionAnalyzer,
+      sectionTitles: options?.sectionTitles ?? 'detect',
+      maxPages: options?.maxPages,
+      generateTitles: options?.generateTitles ?? true,
+      titleGenerator: options?.titleGenerator ?? this.createDefaultTitleGenerator(),
+    };
+
+    // 4. Ingest with metadata and parserOptions
+    const stats = await processor.ingestVirtualFiles([file], {
+      additionalProperties: {
+        projectId,
+        documentId: metadata.documentId,
+        documentTitle: metadata.documentTitle ?? fileName,
+        userId: metadata.userId,
+        userUsername: metadata.userUsername,
+        categoryId: metadata.categoryId,
+        categorySlug: metadata.categorySlug,
+        categoryName: metadata.categoryName,
+        isPublic: metadata.isPublic,
+        tags: metadata.tags,
+        sourceType: "upload",
+        sourceFormat: fileName.split('.').pop()?.toLowerCase(),
+      },
+      parserOptions,
+    });
+
+    logger.info(`[CommunityOrchestrator] Binary document ingestion complete: ${stats.filesProcessed} files, ${stats.scopesCreated} scopes`);
+    return stats;
+  }
+
+  /**
+   * Ingest a media file (image, 3D model) using Core UnifiedProcessor with parserOptions.
+   *
+   * This is the NEW simplified method that:
+   * 1. Creates a VirtualFile from the buffer
+   * 2. Uses UnifiedProcessor.ingestVirtualFiles() with parserOptions for Vision analysis
+   * 3. Propagates community metadata via additionalProperties
+   *
+   * Use this for Vision-enabled analysis of images and 3D models.
+   *
+   * @param buffer - Binary content of the file
+   * @param fileName - File name with extension (e.g., "image.png", "model.glb")
+   * @param projectId - Prisma Project.id
+   * @param metadata - Community metadata to inject on all nodes
+   * @param options - Parser options (enableVision, visionAnalyzer, render3D)
+   */
+  async ingestMediaSimplified(
+    buffer: Buffer,
+    fileName: string,
+    projectId: string,
+    metadata: CommunityNodeMetadata,
+    options?: {
+      enableVision?: boolean;
+      visionAnalyzer?: (imageBuffer: Buffer, prompt?: string) => Promise<string>;
+      render3D?: (modelPath: string) => Promise<Array<{ view: string; buffer: Buffer }>>;
+    }
+  ): Promise<ProcessingStats> {
+    logger.info(`[CommunityOrchestrator] Ingesting media file (simplified): ${fileName} into project: ${projectId}`);
+
+    // 1. Create virtual file
+    const file = createVirtualFileFromContent(buffer, fileName);
+
+    // 2. Get processor
+    const processor = await this.getUnifiedProcessor(projectId);
+
+    // 3. Build parserOptions
+    const parserOptions: ParserOptionsConfig = {
+      enableVision: options?.enableVision,
+      visionAnalyzer: options?.visionAnalyzer,
+      render3D: options?.render3D,
+    };
+
+    // 4. Ingest with metadata and parserOptions
+    const stats = await processor.ingestVirtualFiles([file], {
+      additionalProperties: {
+        projectId,
+        documentId: metadata.documentId,
+        documentTitle: metadata.documentTitle ?? fileName,
+        userId: metadata.userId,
+        userUsername: metadata.userUsername,
+        categoryId: metadata.categoryId,
+        categorySlug: metadata.categorySlug,
+        categoryName: metadata.categoryName,
+        isPublic: metadata.isPublic,
+        tags: metadata.tags,
+        sourceType: "upload",
+        mediaType: this.is3DModel('.' + (fileName.split('.').pop()?.toLowerCase() || '')) ? '3d-model' : 'image',
+      },
+      parserOptions,
+    });
+
+    logger.info(`[CommunityOrchestrator] Media file ingestion complete: ${stats.filesProcessed} files, ${stats.scopesCreated} scopes`);
+    return stats;
+  }
+
+  /**
+   * Ingest virtual files using Core UnifiedProcessor.
+   *
+   * This is the NEW simplified method that:
+   * 1. Uses UnifiedProcessor.ingestVirtualFiles() directly
+   * 2. Propagates community metadata via additionalProperties
+   *
+   * Replaces the old ingestVirtual() method which used IncrementalIngestionManager.ingestGraph().
+   *
+   * @param virtualFiles - Array of virtual files with path and content
+   * @param projectId - Prisma Project.id
+   * @param metadata - Community metadata to inject on all nodes
+   * @param options - Additional options (sourceIdentifier, generateEmbeddings, parserOptions)
+   */
+  async ingestVirtualSimplified(
+    virtualFiles: Array<{ path: string; content: string | Buffer }>,
+    projectId: string,
+    metadata: CommunityNodeMetadata,
+    options?: {
+      sourceIdentifier?: string;
+      generateEmbeddings?: boolean;
+      parserOptions?: ParserOptionsConfig;
+    }
+  ): Promise<ProcessingStats> {
+    logger.info(`[CommunityOrchestrator] Ingesting ${virtualFiles.length} virtual files (simplified) into project: ${projectId}`);
+
+    // 1. Convert to VirtualFile format expected by UnifiedProcessor
+    const sourceIdentifier = options?.sourceIdentifier ?? 'upload';
+    const files: VirtualFile[] = virtualFiles.map((f) => {
+      // Normalize path: remove leading slash if present
+      const normalizedPath = f.path.startsWith('/') ? f.path.slice(1) : f.path;
+      return {
+        path: `${sourceIdentifier}/${normalizedPath}`,
+        content: f.content,
+      };
+    });
+
+    // 2. Get processor
+    const processor = await this.getUnifiedProcessor(projectId);
+
+    // 3. Ingest with metadata
+    const stats = await processor.ingestVirtualFiles(files, {
+      additionalProperties: {
+        projectId,
+        documentId: metadata.documentId,
+        documentTitle: metadata.documentTitle,
+        userId: metadata.userId,
+        userUsername: metadata.userUsername,
+        categoryId: metadata.categoryId,
+        categorySlug: metadata.categorySlug,
+        categoryName: metadata.categoryName,
+        isPublic: metadata.isPublic,
+        tags: metadata.tags,
+        sourceType: 'community-upload',
+      },
+      parserOptions: options?.parserOptions,
+    });
+
+    logger.info(`[CommunityOrchestrator] Virtual files ingestion complete: ${stats.filesProcessed} files, ${stats.scopesCreated} scopes`);
+    return stats;
+  }
+
+  /**
+   * Ingest multiple files (mixed types) using Core UnifiedProcessor.
+   *
+   * This is the NEW simplified method that:
+   * 1. Converts all files to VirtualFile format
+   * 2. Uses UnifiedProcessor.ingestVirtualFiles() with appropriate parserOptions
+   * 3. Propagates community metadata via additionalProperties
+   *
+   * Handles text files, binary documents (PDF, DOCX), and media files (images, 3D).
+   * Replaces the old ingestFiles() method which used IncrementalIngestionManager.ingestGraph().
+   *
+   * @param files - Array of files with fileName and buffer
+   * @param projectId - Prisma Project.id
+   * @param metadata - Community metadata to inject on all nodes
+   * @param options - Parser options and flags
+   */
+  async ingestFilesSimplified(
+    files: Array<{ fileName: string; buffer: Buffer }>,
+    projectId: string,
+    metadata: CommunityNodeMetadata,
+    options?: {
+      enableVision?: boolean;
+      visionAnalyzer?: (imageBuffer: Buffer, prompt?: string) => Promise<string>;
+      render3D?: (modelPath: string) => Promise<Array<{ view: string; buffer: Buffer }>>;
+      sectionTitles?: 'none' | 'detect' | 'llm';
+      generateTitles?: boolean;
+      generateEmbeddings?: boolean;
+      extractEntities?: boolean;
+    }
+  ): Promise<ProcessingStats> {
+    logger.info(`[CommunityOrchestrator] Ingesting ${files.length} files (simplified) into project: ${projectId}`);
+
+    // 1. Convert all files to VirtualFile format
+    const virtualFiles: VirtualFile[] = files.map(({ fileName, buffer }) => ({
+      path: `upload/${fileName}`,
+      content: buffer,
+    }));
+
+    // 2. Get processor
+    const processor = await this.getUnifiedProcessor(projectId);
+
+    // 3. Build parserOptions
+    const parserOptions: ParserOptionsConfig = {
+      enableVision: options?.enableVision,
+      visionAnalyzer: options?.visionAnalyzer,
+      render3D: options?.render3D,
+      sectionTitles: options?.sectionTitles ?? 'detect',
+      generateTitles: options?.generateTitles ?? true,
+      titleGenerator: (options?.generateTitles ?? true) ? this.createDefaultTitleGenerator() : undefined,
+    };
+
+    // 4. Ingest with metadata and parserOptions
+    const stats = await processor.ingestVirtualFiles(virtualFiles, {
+      additionalProperties: {
+        projectId,
+        documentId: metadata.documentId,
+        documentTitle: metadata.documentTitle,
+        userId: metadata.userId,
+        userUsername: metadata.userUsername,
+        categoryId: metadata.categoryId,
+        categorySlug: metadata.categorySlug,
+        categoryName: metadata.categoryName,
+        isPublic: metadata.isPublic,
+        tags: metadata.tags,
+        sourceType: 'upload',
+      },
+      parserOptions,
+    });
+
+    logger.info(`[CommunityOrchestrator] Files ingestion complete: ${stats.filesProcessed} files, ${stats.scopesCreated} scopes`);
+    return stats;
   }
 
   // ==========================================================================
@@ -862,526 +1156,6 @@ export class CommunityOrchestratorAdapter {
     return CommunityOrchestratorAdapter.TEXT_EXTENSIONS.has(ext.toLowerCase());
   }
 
-  // ==========================================================================
-  // Unified File Ingestion
-  // ==========================================================================
-
-  /**
-   * Unified file ingestion - handles all file types in a single batch operation.
-   *
-   * This method:
-   * 1. Classifies files by type (binary document, media, text)
-   * 2. Parses each file with the appropriate parser
-   * 3. Collects all nodes/relationships
-   * 4. Performs a SINGLE ingestGraph operation
-   * 5. Generates embeddings in batch at the end
-   *
-   * Use this for all ingestion operations to ensure consistent behavior
-   * and optimal performance (single DB write, batch embedding generation).
-   */
-  async ingestFiles(options: UnifiedIngestionOptions): Promise<UnifiedIngestionResult> {
-    await this.initialize();
-
-    const {
-      files,
-      metadata,
-      documentId,
-      enableVision = false,
-      visionAnalyzer,
-      render3D,
-      sectionTitles = 'detect',
-      generateTitles = true,
-      generateEmbeddings = true,
-      extractEntities = false,
-    } = options;
-
-    const projectId = `doc-${documentId}`;
-    const virtualRoot = `/virtual/${documentId}/upload`;
-
-    // Stats tracking
-    const stats = {
-      textFiles: 0,
-      binaryDocs: 0,
-      mediaFiles: 0,
-      skipped: 0,
-      textNodes: 0,
-      binaryNodes: 0,
-      mediaNodes: 0,
-    };
-    const allWarnings: string[] = [];
-
-    // Collected nodes and relationships from all parsers
-    const allNodes: Array<{ labels: string[]; id: string; properties: Record<string, any> }> = [];
-    const allRelationships: Array<{ type: string; from: string; to: string; properties?: Record<string, any> }> = [];
-
-    // Virtual files for text content (will be parsed together)
-    const virtualTextFiles: Array<{ path: string; content: string }> = [];
-
-    logger.info(`[UnifiedIngestion] Processing ${files.length} files for document: ${documentId}`);
-
-    // Process each file
-    for (const { fileName, buffer } of files) {
-      const ext = '.' + (fileName.split('.').pop()?.toLowerCase() || '');
-
-      // 1. Binary documents (PDF, DOCX, etc.)
-      if (this.isBinaryDocument(ext)) {
-        try {
-          logger.info(`[UnifiedIngestion] Parsing binary document: ${fileName}`);
-
-          // Create title generator if needed
-          let titleGenerator: ((sections: Array<{ index: number; content: string }>) => Promise<Array<{ index: number; title: string }>>) | undefined;
-          if (generateTitles) {
-            titleGenerator = this.createDefaultTitleGenerator();
-          }
-
-          const parseResult = await documentParser.parse({
-            filePath: fileName,
-            binaryContent: buffer,
-            projectId,
-            options: {
-              enableVision,
-              sectionTitles,
-              generateTitles,
-              titleGenerator,
-            },
-          });
-
-          // Collect nodes and relationships
-          for (const node of parseResult.nodes) {
-            allNodes.push({
-              labels: node.labels,
-              id: node.id,
-              properties: node.properties,
-            });
-          }
-          for (const rel of parseResult.relationships) {
-            allRelationships.push({
-              type: rel.type,
-              from: rel.from,
-              to: rel.to,
-              properties: rel.properties || {},
-            });
-          }
-
-          stats.binaryDocs++;
-          stats.binaryNodes += parseResult.nodes.length;
-          if (parseResult.warnings) {
-            allWarnings.push(...parseResult.warnings);
-          }
-          logger.info(`[UnifiedIngestion] Binary parsed: ${fileName} -> ${parseResult.nodes.length} nodes`);
-        } catch (err: any) {
-          logger.warn(`[UnifiedIngestion] Binary failed ${fileName}: ${err.message}`);
-          stats.skipped++;
-        }
-        continue;
-      }
-
-      // 2. Media files (images, 3D models)
-      if (this.isMediaFile(ext)) {
-        try {
-          logger.info(`[UnifiedIngestion] Parsing media file: ${fileName}`);
-
-          // Write to temp file for media parser
-          const fs = await import('fs');
-          const path = await import('path');
-          const os = await import('os');
-          const tempPath = path.join(os.tmpdir(), `ragforge-media-${Date.now()}-${path.basename(fileName)}`);
-          fs.writeFileSync(tempPath, buffer);
-
-          try {
-            // Build parse options for core media parser
-            const mediaParseOptions: MediaParseOptions = {
-              enableVision,
-              visionAnalyzer,
-              render3D,
-            };
-
-            const parseResult = await mediaParser.parse({
-              filePath: tempPath,
-              projectId,
-              options: mediaParseOptions as unknown as Record<string, unknown>,
-            });
-
-            // Update file paths to use original path instead of temp
-            for (const node of parseResult.nodes) {
-              if (node.properties.file === tempPath) {
-                node.properties.file = fileName;
-              }
-              if (node.properties.sourcePath === tempPath) {
-                node.properties.sourcePath = fileName;
-              }
-              allNodes.push({
-                labels: node.labels,
-                id: node.id,
-                properties: node.properties,
-              });
-            }
-            for (const rel of parseResult.relationships) {
-              allRelationships.push({
-                type: rel.type,
-                from: rel.from,
-                to: rel.to,
-                properties: rel.properties || {},
-              });
-            }
-
-            stats.mediaFiles++;
-            stats.mediaNodes += parseResult.nodes.length;
-            if (parseResult.warnings) {
-              allWarnings.push(...parseResult.warnings);
-            }
-
-            // Check if vision description was generated
-            const hasDescription = parseResult.nodes.some(n => n.properties.description);
-            logger.info(`[UnifiedIngestion] Media parsed: ${fileName} -> ${parseResult.nodes.length} nodes${hasDescription ? ' (with vision description)' : ''}`);
-          } finally {
-            // Clean up temp file
-            try { fs.unlinkSync(tempPath); } catch {}
-          }
-        } catch (err: any) {
-          logger.warn(`[UnifiedIngestion] Media failed ${fileName}: ${err.message}`);
-          stats.skipped++;
-        }
-        continue;
-      }
-
-      // 3. Text files - collect for batch parsing
-      if (this.isTextFile(ext) || ext === '') {
-        try {
-          const content = buffer.toString('utf-8');
-          virtualTextFiles.push({
-            path: `${virtualRoot}/${fileName}`,
-            content,
-          });
-          stats.textFiles++;
-        } catch (err: any) {
-          logger.warn(`[UnifiedIngestion] Failed to read ${fileName}: ${err.message}`);
-          stats.skipped++;
-        }
-        continue;
-      }
-
-      // Unknown file type
-      logger.info(`[UnifiedIngestion] Skipping unsupported file: ${fileName}`);
-      stats.skipped++;
-    }
-
-    // Parse all text files together in one batch
-    if (virtualTextFiles.length > 0) {
-      logger.info(`[UnifiedIngestion] Parsing ${virtualTextFiles.length} text files`);
-
-      const parseResult = await this.sourceAdapter.parse({
-        source: {
-          type: 'virtual',
-          virtualFiles: virtualTextFiles,
-        },
-        projectId,
-      });
-
-      for (const node of parseResult.graph.nodes) {
-        allNodes.push({
-          labels: node.labels,
-          id: node.id,
-          properties: node.properties,
-        });
-      }
-      for (const rel of parseResult.graph.relationships) {
-        allRelationships.push({
-          type: rel.type,
-          from: rel.from,
-          to: rel.to,
-          properties: rel.properties || {},
-        });
-      }
-      stats.textNodes = parseResult.graph.nodes.length;
-      logger.info(`[UnifiedIngestion] Text parsed: ${virtualTextFiles.length} files -> ${parseResult.graph.nodes.length} nodes`);
-    }
-
-    // Inject community metadata on ALL nodes
-    logger.info(`[UnifiedIngestion] Injecting metadata on ${allNodes.length} nodes`);
-    for (const node of allNodes) {
-      node.properties.projectId = projectId;
-      node.properties.documentId = metadata.documentId;
-      node.properties.documentTitle = metadata.documentTitle;
-      node.properties.userId = metadata.userId;
-      if (metadata.userUsername) {
-        node.properties.userUsername = metadata.userUsername;
-      }
-      node.properties.categoryId = metadata.categoryId;
-      node.properties.categorySlug = metadata.categorySlug;
-      if (metadata.categoryName) {
-        node.properties.categoryName = metadata.categoryName;
-      }
-      if (metadata.isPublic !== undefined) {
-        node.properties.isPublic = metadata.isPublic;
-      }
-      if (metadata.tags && metadata.tags.length > 0) {
-        node.properties.tags = metadata.tags;
-      }
-      node.properties.sourceType = 'community-upload';
-    }
-
-    // Entity extraction (via transformGraph hook)
-    logger.info(`[UnifiedIngestion] Entity extraction check: enabled=${this.entityExtractionEnabled}, client=${!!this.entityExtractionClient}, nodes=${allNodes.length}`);
-    if (this.entityExtractionEnabled && this.entityExtractionClient && allNodes.length > 0) {
-      try {
-        logger.info(`[UnifiedIngestion] Running entity extraction on ${allNodes.length} nodes`);
-        const graph = { nodes: allNodes, relationships: allRelationships, metadata: { filesProcessed: files.length, nodesGenerated: allNodes.length } };
-
-        // Call the transformGraph hook manually (since ingestFiles doesn't go through orchestrator.ingest)
-        const isAvailable = await this.entityExtractionClient.isAvailable();
-        if (isAvailable) {
-          const nodesBefore = graph.nodes.length;
-
-          // Debug: check node types and content
-          const nodeTypes = graph.nodes.reduce((acc, n) => {
-            const label = n.labels[0] || 'unknown';
-            acc[label] = (acc[label] || 0) + 1;
-            return acc;
-          }, {} as Record<string, number>);
-
-          const nodesWithContent = graph.nodes.filter(n => n.properties._content).length;
-
-          logger.info(
-            `[UnifiedIngestion] Starting entity extraction: ${nodesBefore} nodes, ` +
-            `${nodesWithContent} with extractable content, types: ${JSON.stringify(nodeTypes)}`
-          );
-
-          // Create embedding function for hybrid deduplication
-          const embedFunction = this.embeddingService
-            ? async (texts: string[]) => {
-                return await this.embeddingService!.embedBatch(texts);
-              }
-            : undefined;
-
-          const entityTransform = createEntityExtractionTransform({
-            ...this.entityExtractionClient.getConfig(),
-            projectId, // Pass projectId so Entity nodes get correct project assignment
-            verbose: this.verbose,
-            deduplication: {
-              strategy: embedFunction ? 'hybrid' : 'fuzzy',
-              fuzzyThreshold: 0.85,
-              embeddingThreshold: 0.9,
-            },
-            embedFunction,
-          });
-
-          const transformedGraph = await entityTransform(graph as any);
-
-          // Count entity nodes and MENTIONS relationships
-          const entityNodes = transformedGraph.nodes.filter(n => n.labels.includes('Entity'));
-          const mentionsRels = transformedGraph.relationships.filter(r => r.type === 'MENTIONS');
-
-          logger.info(
-            `[UnifiedIngestion] Entity extraction completed: ` +
-            `${entityNodes.length} Entity nodes, ${mentionsRels.length} MENTIONS relations, ` +
-            `total nodes: ${nodesBefore} → ${transformedGraph.nodes.length}`
-          );
-
-          if (entityNodes.length > 0) {
-            const entityTypes = entityNodes.reduce((acc, node) => {
-              const type = node.properties.entityType || 'unknown';
-              acc[type] = (acc[type] || 0) + 1;
-              return acc;
-            }, {} as Record<string, number>);
-            logger.info(`[UnifiedIngestion] Entity types: ${JSON.stringify(entityTypes)}`);
-          }
-
-          // Update allNodes and allRelationships with transformed graph
-          allNodes.length = 0;
-          allNodes.push(...transformedGraph.nodes);
-          allRelationships.length = 0;
-          allRelationships.push(...transformedGraph.relationships);
-        } else {
-          logger.warn("[UnifiedIngestion] GLiNER service not available, skipping entity extraction");
-        }
-      } catch (error) {
-        logger.error("[UnifiedIngestion] Entity extraction failed:", error);
-        // Continue without entity extraction
-      }
-    }
-
-    // Single batch ingest into Neo4j
-    if (allNodes.length > 0) {
-      logger.info(`[UnifiedIngestion] Ingesting ${allNodes.length} nodes, ${allRelationships.length} relationships`);
-      await this.ingestionManager!.ingestGraph(
-        { nodes: allNodes, relationships: allRelationships },
-        { projectId, markDirty: true }
-      );
-    }
-
-    // Process cross-file references for text files
-    if (virtualTextFiles.length > 0) {
-      try {
-        const refResult = await this.ingestionManager!.processVirtualFileReferences(
-          projectId,
-          virtualTextFiles,
-          { verbose: this.verbose }
-        );
-        if (refResult.created > 0 || refResult.pending > 0) {
-          logger.info(`[UnifiedIngestion] Reference linking: ${refResult.created} created, ${refResult.pending} pending`);
-        }
-      } catch (err) {
-        logger.warn(`[UnifiedIngestion] Reference linking failed: ${err instanceof Error ? err.message : err}`);
-      }
-    }
-
-    // Generate embeddings in batch
-    let embeddingsGenerated = 0;
-    if (generateEmbeddings && allNodes.length > 0) {
-      embeddingsGenerated = await this.generateEmbeddingsForDocument(documentId);
-    }
-
-    logger.info(`[UnifiedIngestion] Complete: ${allNodes.length} nodes, ${allRelationships.length} rels, ${embeddingsGenerated} embeddings`);
-
-    return {
-      nodesCreated: allNodes.length,
-      relationshipsCreated: allRelationships.length,
-      embeddingsGenerated,
-      stats,
-      warnings: allWarnings.length > 0 ? allWarnings : undefined,
-    };
-  }
-
-  /**
-   * Ingest a binary document (PDF, DOCX, etc.) using the new DocumentParser.
-   *
-   * This method uses the refactored DocumentParser from core which creates:
-   * - File node with the original path (e.g., "paper.pdf")
-   * - MarkdownDocument node with sourceFormat and parsedWith metadata
-   * - MarkdownSection nodes for each detected section
-   *
-   * @example
-   * await adapter.ingestBinaryDocument({
-   *   filePath: "paper.pdf",
-   *   binaryContent: pdfBuffer,
-   *   metadata: { documentId: "123", ... },
-   *   enableVision: true,
-   *   visionAnalyzer: async (buf, prompt) => { ... },
-   * });
-   */
-  async ingestBinaryDocument(options: {
-    /** Original file path (e.g., "paper.pdf") */
-    filePath: string;
-    /** Binary content of the file */
-    binaryContent: Buffer;
-    /** Community metadata to inject on all nodes */
-    metadata: CommunityNodeMetadata;
-    /** Project ID (derived from documentId if not provided) */
-    projectId?: string;
-    /** Enable Vision-based parsing for better quality (default: false) */
-    enableVision?: boolean;
-    /** Vision analyzer function (required if enableVision is true) */
-    visionAnalyzer?: (imageBuffer: Buffer, prompt?: string) => Promise<string>;
-    /** Section title detection mode (default: 'detect') */
-    sectionTitles?: 'none' | 'detect' | 'llm';
-    /** Maximum pages to process */
-    maxPages?: number;
-    /** Generate titles for sections without one using LLM (default: true for community-docs) */
-    generateTitles?: boolean;
-    /** Custom title generator function (uses default LLM-based one if not provided) */
-    titleGenerator?: (sections: Array<{ index: number; content: string }>) => Promise<Array<{ index: number; title: string }>>;
-  }): Promise<{ nodesCreated: number; relationshipsCreated: number; warnings?: string[] }> {
-    await this.initialize();
-
-    const {
-      filePath,
-      binaryContent,
-      metadata,
-      projectId = `doc-${metadata.documentId}`,
-      enableVision = false,
-      visionAnalyzer,
-      sectionTitles = 'detect',
-      maxPages,
-      generateTitles = true, // Default to true for community-docs
-      titleGenerator,
-    } = options;
-
-    logger.info(`Ingesting binary document: ${filePath} (${binaryContent.length} bytes), generateTitles: ${generateTitles}`);
-
-    try {
-      // Create default title generator using LLM if enabled and not provided
-      let effectiveTitleGenerator = titleGenerator;
-      if (generateTitles && !titleGenerator) {
-        logger.info(`Creating default title generator for ${filePath}`);
-        effectiveTitleGenerator = this.createDefaultTitleGenerator();
-      }
-
-      // Parse document using the new DocumentParser
-      const parseOptions: DocumentParseOptions = {
-        enableVision,
-        visionAnalyzer,
-        sectionTitles,
-        maxPages,
-        generateTitles,
-        titleGenerator: effectiveTitleGenerator,
-      };
-
-      const parseResult = await documentParser.parse({
-        filePath,
-        binaryContent,
-        projectId,
-        options: parseOptions as Record<string, unknown>,
-      });
-
-      logger.info(`Parsed ${filePath}: ${parseResult.nodes.length} nodes, ${parseResult.relationships.length} relationships`);
-
-      // Inject community metadata on all nodes
-      for (const node of parseResult.nodes) {
-        node.properties.projectId = projectId;
-        node.properties.documentId = metadata.documentId;
-        node.properties.documentTitle = metadata.documentTitle;
-        node.properties.userId = metadata.userId;
-        if (metadata.userUsername) {
-          node.properties.userUsername = metadata.userUsername;
-        }
-        node.properties.categoryId = metadata.categoryId;
-        node.properties.categorySlug = metadata.categorySlug;
-        if (metadata.categoryName) {
-          node.properties.categoryName = metadata.categoryName;
-        }
-        if (metadata.isPublic !== undefined) {
-          node.properties.isPublic = metadata.isPublic;
-        }
-        if (metadata.tags && metadata.tags.length > 0) {
-          node.properties.tags = metadata.tags;
-        }
-        node.properties.sourceType = "community-upload";
-      }
-
-      // Convert ParserNode to ingestion format
-      const graphNodes = parseResult.nodes.map((n) => ({
-        labels: n.labels,
-        id: n.id,
-        properties: n.properties,
-      }));
-
-      const graphRelationships = parseResult.relationships.map((r) => ({
-        type: r.type,
-        from: r.from,
-        to: r.to,
-        properties: r.properties || {},
-      }));
-
-      // Ingest graph into Neo4j
-      await this.ingestionManager!.ingestGraph(
-        { nodes: graphNodes, relationships: graphRelationships },
-        { projectId, markDirty: true }
-      );
-
-      logger.info(`Binary document ingested: ${graphNodes.length} nodes, ${graphRelationships.length} relationships`);
-
-      return {
-        nodesCreated: graphNodes.length,
-        relationshipsCreated: graphRelationships.length,
-        warnings: parseResult.warnings,
-      };
-    } catch (err) {
-      logger.error(`Failed to ingest binary document ${filePath}: ${err}`);
-      throw err;
-    }
-  }
-
   /**
    * Create a default title generator (disabled - no LLM enrichment).
    * Title generation is now disabled as EnrichmentService was removed.
@@ -1393,169 +1167,20 @@ export class CommunityOrchestratorAdapter {
     };
   }
 
-  /**
-   * Ingest a media file (image, 3D model) using the MediaParser.
-   *
-   * This method uses the MediaParser from core which creates:
-   * - ImageFile or ThreeDFile node with optional Vision analysis
-   * - File node for the source file
-   *
-   * @example
-   * await adapter.ingestMedia({
-   *   filePath: "image.png",
-   *   binaryContent: imageBuffer,
-   *   metadata: { documentId: "123", ... },
-   *   enableVision: true,
-   *   visionAnalyzer: async (buf, prompt) => { ... },
-   * });
-   */
-  async ingestMedia(options: {
-    /** Original file path (e.g., "image.png", "model.glb") */
-    filePath: string;
-    /** Binary content of the file */
-    binaryContent: Buffer;
-    /** Community metadata to inject on all nodes */
-    metadata: CommunityNodeMetadata;
-    /** Project ID (derived from documentId if not provided) */
-    projectId?: string;
-    /** Enable Vision-based analysis (default: false) */
-    enableVision?: boolean;
-    /** Vision analyzer function (required if enableVision is true) */
-    visionAnalyzer?: (imageBuffer: Buffer, prompt?: string) => Promise<string>;
-    /** 3D render function (required for 3D models if enableVision is true) */
-    render3D?: (modelPath: string) => Promise<{ view: string; buffer: Buffer }[]>;
-  }): Promise<{ nodesCreated: number; relationshipsCreated: number; warnings?: string[] }> {
-    await this.initialize();
-
-    const {
-      filePath,
-      binaryContent,
-      metadata,
-      projectId = `doc-${metadata.documentId}`,
-      enableVision = false,
-      visionAnalyzer,
-      render3D,
-    } = options;
-
-    logger.info(`Ingesting media file: ${filePath} (${binaryContent.length} bytes)`);
-
-    try {
-      // For media files, we need to write to a temp file for the parser
-      // (the parser reads the file directly for dimensions/GLTF metadata)
-      const fs = await import('fs');
-      const path = await import('path');
-      const os = await import('os');
-
-      const tempDir = os.tmpdir();
-      const tempPath = path.join(tempDir, `ragforge-media-${Date.now()}-${path.basename(filePath)}`);
-
-      // Write buffer to temp file
-      fs.writeFileSync(tempPath, binaryContent);
-
-      try {
-        // Parse media using the MediaParser
-        const parseOptions: MediaParseOptions = {
-          enableVision,
-          visionAnalyzer,
-          render3D,
-        };
-
-        const parseResult = await mediaParser.parse({
-          filePath: tempPath, // Use temp path for parsing
-          projectId,
-          options: parseOptions as Record<string, unknown>,
-        });
-
-        logger.info(`Parsed ${filePath}: ${parseResult.nodes.length} nodes, ${parseResult.relationships.length} relationships`);
-
-        // Update file paths in nodes to use original path instead of temp path
-        for (const node of parseResult.nodes) {
-          if (node.properties.file === tempPath) {
-            node.properties.file = filePath;
-          }
-          if (node.properties.sourcePath === tempPath) {
-            node.properties.sourcePath = filePath;
-          }
-          if (node.properties.absolutePath === tempPath) {
-            node.properties.absolutePath = filePath;
-          }
-          if (node.properties.path === tempPath) {
-            node.properties.path = filePath;
-          }
-
-          // Inject community metadata
-          node.properties.projectId = projectId;
-          node.properties.documentId = metadata.documentId;
-          node.properties.documentTitle = metadata.documentTitle;
-          node.properties.userId = metadata.userId;
-          if (metadata.userUsername) {
-            node.properties.userUsername = metadata.userUsername;
-          }
-          node.properties.categoryId = metadata.categoryId;
-          node.properties.categorySlug = metadata.categorySlug;
-          if (metadata.categoryName) {
-            node.properties.categoryName = metadata.categoryName;
-          }
-          if (metadata.isPublic !== undefined) {
-            node.properties.isPublic = metadata.isPublic;
-          }
-          if (metadata.tags && metadata.tags.length > 0) {
-            node.properties.tags = metadata.tags;
-          }
-          node.properties.sourceType = "community-upload";
-        }
-
-        // Convert ParserNode to ingestion format
-        const graphNodes = parseResult.nodes.map((n) => ({
-          labels: n.labels,
-          id: n.id,
-          properties: n.properties,
-        }));
-
-        const graphRelationships = parseResult.relationships.map((r) => ({
-          type: r.type,
-          from: r.from,
-          to: r.to,
-          properties: r.properties || {},
-        }));
-
-        // Ingest graph into Neo4j
-        await this.ingestionManager!.ingestGraph(
-          { nodes: graphNodes, relationships: graphRelationships },
-          { projectId, markDirty: true }
-        );
-
-        logger.info(`Media file ingested: ${graphNodes.length} nodes, ${graphRelationships.length} relationships`);
-
-        return {
-          nodesCreated: graphNodes.length,
-          relationshipsCreated: graphRelationships.length,
-          warnings: parseResult.warnings,
-        };
-      } finally {
-        // Clean up temp file
-        try {
-          fs.unlinkSync(tempPath);
-        } catch {
-          // Ignore cleanup errors
-        }
-      }
-    } catch (err) {
-      logger.error(`Failed to ingest media file ${filePath}: ${err}`);
-      throw err;
-    }
-  }
+  // ==========================================================================
+  // Embedding Generation
+  // ==========================================================================
 
   /**
-   * Generate embeddings for all nodes of a document
+   * Generate embeddings for all nodes of a project
    * Uses ragforge core EmbeddingService with batching and multi-embedding support
    *
-   * @param documentId - The document ID to generate embeddings for
+   * @param projectId - The project ID to generate embeddings for
    * @param onProgress - Optional callback for progress updates (current, total)
    * @returns Number of embeddings generated
    */
-  async generateEmbeddingsForDocument(
-    documentId: string,
+  async generateEmbeddingsForProject(
+    projectId: string,
     onProgress?: (current: number, total: number) => void
   ): Promise<number> {
     if (!this.embeddingService) {
@@ -1563,8 +1188,7 @@ export class CommunityOrchestratorAdapter {
       return 0;
     }
 
-    const projectId = `doc-${documentId}`;
-    logger.info(`Generating embeddings for document: ${documentId} (projectId: ${projectId})`);
+    logger.info(`Generating embeddings for project: ${projectId}`);
 
     try {
       // Count nodes that need embeddings (for progress reporting)
@@ -1594,7 +1218,7 @@ export class CommunityOrchestratorAdapter {
       }
 
       logger.info(
-        `Generated embeddings for document ${documentId}: ` +
+        `Generated embeddings for project ${projectId}: ` +
           `${result.totalEmbedded} total (name: ${result.embeddedByType.name}, ` +
           `content: ${result.embeddedByType.content}, description: ${result.embeddedByType.description}), ` +
           `${result.skippedCount} cached, ${result.durationMs}ms`
@@ -1602,7 +1226,7 @@ export class CommunityOrchestratorAdapter {
 
       return result.totalEmbedded;
     } catch (err) {
-      logger.error(`Failed to generate embeddings for document ${documentId}: ${err}`);
+      logger.error(`Failed to generate embeddings for project ${projectId}: ${err}`);
       return 0;
     }
   }
@@ -1913,12 +1537,12 @@ export class CommunityOrchestratorAdapter {
         results: communityResults.map((r) => ({
           node: r.node,
           score: r.score,
-          projectId: `doc-${r.node.documentId || "unknown"}`,
+          projectId: r.node.projectId || "unknown",
           projectPath: r.node.absolutePath || r.filePath || "",
           filePath: r.node.absolutePath || r.filePath || r.node.file || "",
         })),
         totalCount: result.totalCount,
-        searchedProjects: [], // community-docs doesn't use projects the same way
+        searchedProjects: [], // community-docs uses Prisma projects
         graph,
         summary,
       };
@@ -2026,13 +1650,12 @@ export class CommunityOrchestratorAdapter {
   }
 
   /**
-   * Delete all nodes for a document
+   * Delete all nodes for a document (source within a project)
    */
   async deleteDocument(documentId: string): Promise<number> {
     await this.initialize();
-    const projectId = `doc-${documentId}`;
 
-    // Delete using the ingestion manager
+    // Delete by documentId (source tracking within project)
     const result = await this.neo4j.run(
       `MATCH (n {documentId: $documentId}) DETACH DELETE n RETURN count(n) as count`,
       { documentId }
@@ -2040,6 +1663,24 @@ export class CommunityOrchestratorAdapter {
 
     const count = result.records[0]?.get("count")?.toNumber() ?? 0;
     logger.info(`Deleted ${count} nodes for document: ${documentId}`);
+
+    return count;
+  }
+
+  /**
+   * Delete all nodes for a project
+   */
+  async deleteProjectNodes(projectId: string): Promise<number> {
+    await this.initialize();
+
+    // Delete by projectId
+    const result = await this.neo4j.run(
+      `MATCH (n {projectId: $projectId}) DETACH DELETE n RETURN count(n) as count`,
+      { projectId }
+    );
+
+    const count = result.records[0]?.get("count")?.toNumber() ?? 0;
+    logger.info(`Deleted ${count} nodes for project: ${projectId}`);
 
     return count;
   }

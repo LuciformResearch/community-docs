@@ -187,27 +187,26 @@ export class CommunityIngestionService {
     for (const file of binaryDocs) {
       try {
         logger.info(`[IngestionService] Processing binary document: ${file.path}`);
-        const docResult = await this.orchestrator.ingestBinaryDocument({
-          filePath: file.path,
-          binaryContent: file.content,
-          metadata,
+        const docResult = await this.orchestrator.ingestBinaryDocumentSimplified(
+          file.content,
+          file.path,
           projectId,
-          enableVision,
-          sectionTitles,
-          generateTitles,
-        });
+          metadata,
+          {
+            enableVision,
+            sectionTitles,
+            generateTitles,
+          }
+        );
 
         result.files.push({
           path: file.path,
           type: 'binary',
           success: true,
-          nodesCreated: docResult.nodesCreated,
+          nodesCreated: docResult.filesProcessed + docResult.scopesCreated,
         });
-        result.stats.nodesCreated += docResult.nodesCreated;
-        result.stats.relationshipsCreated += docResult.relationshipsCreated;
-        if (docResult.warnings) {
-          result.warnings.push(...docResult.warnings);
-        }
+        result.stats.nodesCreated += docResult.filesProcessed + docResult.scopesCreated;
+        result.stats.relationshipsCreated += docResult.relationsCreated;
         result.stats.filesProcessed++;
       } catch (err: any) {
         logger.error(`[IngestionService] Failed to ingest binary document ${file.path}: ${err.message}`);
@@ -226,25 +225,24 @@ export class CommunityIngestionService {
     for (const file of mediaFiles) {
       try {
         logger.info(`[IngestionService] Processing media file: ${file.path}`);
-        const mediaResult = await this.orchestrator.ingestMedia({
-          filePath: file.path,
-          binaryContent: file.content,
-          metadata,
+        const mediaResult = await this.orchestrator.ingestMediaSimplified(
+          file.content,
+          file.path,
           projectId,
-          enableVision,
-        });
+          metadata,
+          {
+            enableVision,
+          }
+        );
 
         result.files.push({
           path: file.path,
           type: 'media',
           success: true,
-          nodesCreated: mediaResult.nodesCreated,
+          nodesCreated: mediaResult.filesProcessed + mediaResult.scopesCreated,
         });
-        result.stats.nodesCreated += mediaResult.nodesCreated;
-        result.stats.relationshipsCreated += mediaResult.relationshipsCreated;
-        if (mediaResult.warnings) {
-          result.warnings.push(...mediaResult.warnings);
-        }
+        result.stats.nodesCreated += mediaResult.filesProcessed + mediaResult.scopesCreated;
+        result.stats.relationshipsCreated += mediaResult.relationsCreated;
         result.stats.filesProcessed++;
       } catch (err: any) {
         logger.error(`[IngestionService] Failed to ingest media ${file.path}: ${err.message}`);
@@ -259,7 +257,7 @@ export class CommunityIngestionService {
       }
     }
 
-    // Process text/code files in batch via ingestVirtual
+    // Process text/code files in batch via ingestVirtualSimplified
     if (textFiles.length > 0) {
       try {
         logger.info(`[IngestionService] Processing ${textFiles.length} text files`);
@@ -268,24 +266,27 @@ export class CommunityIngestionService {
           content: f.content.toString('utf-8'),
         }));
 
-        const textResult = await this.orchestrator.ingestVirtual({
+        const textResult = await this.orchestrator.ingestVirtualSimplified(
           virtualFiles,
-          metadata,
           projectId,
-          sourceIdentifier: 'upload',
-          generateEmbeddings: false, // We'll do it at the end
-        });
+          metadata,
+          {
+            sourceIdentifier: 'upload',
+            generateEmbeddings: false, // We'll do it at the end
+          }
+        );
 
+        const nodesPerFile = Math.floor((textResult.filesProcessed + textResult.scopesCreated) / textFiles.length);
         for (const file of textFiles) {
           result.files.push({
             path: file.path,
             type: 'text',
             success: true,
-            nodesCreated: Math.floor(textResult.nodesCreated / textFiles.length), // Approximate
+            nodesCreated: nodesPerFile, // Approximate
           });
         }
-        result.stats.nodesCreated += textResult.nodesCreated;
-        result.stats.relationshipsCreated += textResult.relationshipsCreated;
+        result.stats.nodesCreated += textResult.filesProcessed + textResult.scopesCreated;
+        result.stats.relationshipsCreated += textResult.relationsCreated;
         result.stats.filesProcessed += textFiles.length;
       } catch (err: any) {
         logger.error(`[IngestionService] Failed to ingest text files: ${err.message}`);
@@ -305,10 +306,9 @@ export class CommunityIngestionService {
     // Generate embeddings if requested
     if (generateEmbeddings && result.stats.nodesCreated > 0) {
       try {
-        logger.info(`[IngestionService] Generating embeddings for ${result.stats.nodesCreated} nodes`);
-        // generateEmbeddingsForDocument calculates projectId from documentId internally
-        const embeddingsGenerated = await this.orchestrator.generateEmbeddingsForDocument(
-          metadata.documentId
+        logger.info(`[IngestionService] Generating embeddings for ${result.stats.nodesCreated} nodes (project: ${metadata.projectId})`);
+        const embeddingsGenerated = await this.orchestrator.generateEmbeddingsForProject(
+          metadata.projectId
         );
         result.stats.embeddingsGenerated = embeddingsGenerated;
       } catch (err: any) {

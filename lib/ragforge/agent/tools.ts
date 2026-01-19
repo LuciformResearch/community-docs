@@ -182,6 +182,7 @@ export interface SavedAttachment {
 export interface ToolContext {
   orchestrator: CommunityOrchestratorAdapter;
   neo4j: Neo4jClient;
+  projectId?: string;  // Prisma Project.id for scoping ingestion
   userId?: string;
   categorySlug?: string;
   attachments?: SavedAttachment[];
@@ -285,18 +286,17 @@ The document will be parsed, chunked, and indexed for semantic search.`,
         console.log(`[ingest_document] title="${title}", filename=${filename}`);
 
         try {
-          // Generate a unique document ID
-          const documentId = `doc-${Date.now()}`;
+          // Generate unique IDs
+          const timestamp = Date.now();
+          const projectId = ctx.projectId || `agent-project-${timestamp}`;
+          const documentId = `agent-doc-${timestamp}`;
           const finalFilename = filename || `${title.replace(/\s+/g, "-").toLowerCase()}.md`;
 
-          const result = await ctx.orchestrator.ingestVirtual({
-            virtualFiles: [
-              {
-                path: finalFilename,
-                content,
-              },
-            ],
-            metadata: {
+          const result = await ctx.orchestrator.ingestVirtualSimplified(
+            [{ path: finalFilename, content }],
+            projectId,
+            {
+              projectId,
               documentId,
               documentTitle: title,
               userId: ctx.userId || "agent-user",
@@ -304,18 +304,17 @@ The document will be parsed, chunked, and indexed for semantic search.`,
               categorySlug: ctx.categorySlug || "agent-ingested",
               tags,
             },
-            sourceIdentifier: "agent-upload",
-            generateEmbeddings: true,
-          });
-
-          // Generate embeddings after ingestion
-          await ctx.orchestrator.generateEmbeddingsForDocument(documentId);
+            {
+              sourceIdentifier: "agent-upload",
+              generateEmbeddings: true,
+            }
+          );
 
           return {
             success: true,
             documentId,
             title,
-            nodeCount: result.nodesCreated,
+            nodeCount: result.filesProcessed + result.scopesCreated,
             message: `Document "${title}" has been ingested and is now searchable.`,
           };
         } catch (error: any) {
@@ -520,26 +519,25 @@ Can optionally ingest the page into the knowledge base.`,
 
           // Optionally ingest
           if (ingest && content) {
-            const documentId = `web-${Date.now()}`;
-            await ctx.orchestrator.ingestVirtual({
-              virtualFiles: [
-                {
-                  path: `${new URL(url).hostname}.md`,
-                  content: `# ${title}\n\nSource: ${url}\n\n${content}`,
-                },
-              ],
-              metadata: {
+            const timestamp = Date.now();
+            const projectId = ctx.projectId || `agent-project-${timestamp}`;
+            const documentId = `web-${timestamp}`;
+            await ctx.orchestrator.ingestVirtualSimplified(
+              [{ path: `${new URL(url).hostname}.md`, content: `# ${title}\n\nSource: ${url}\n\n${content}` }],
+              projectId,
+              {
+                projectId,
                 documentId,
                 documentTitle: title,
                 userId: ctx.userId || "agent-user",
                 categoryId: "cat-web",
                 categorySlug: "web-pages",
               },
-              sourceIdentifier: "web-fetch",
-              generateEmbeddings: true,
-            });
-
-            await ctx.orchestrator.generateEmbeddingsForDocument(documentId);
+              {
+                sourceIdentifier: "web-fetch",
+                generateEmbeddings: true,
+              }
+            );
 
             return {
               success: true,
@@ -1014,7 +1012,9 @@ Returns a description or extracted text from the file.`,
         }
 
         try {
-          const documentId = `upload-${Date.now()}`;
+          const timestamp = Date.now();
+          const projectId = ctx.projectId || `agent-project-${timestamp}`;
+          const documentId = `upload-${timestamp}`;
           const documentTitle = title || attachment.filename;
 
           if (attachment.fileType === "zip") {
@@ -1045,20 +1045,22 @@ Returns a description or extracted text from the file.`,
               };
             }
 
-            const result = await ctx.orchestrator.ingestVirtual({
+            const result = await ctx.orchestrator.ingestVirtualSimplified(
               virtualFiles,
-              metadata: {
+              projectId,
+              {
+                projectId,
                 documentId,
                 documentTitle,
                 userId: ctx.userId || "chat-user",
                 categoryId: "cat-uploads",
                 categorySlug: "uploads",
               },
-              sourceIdentifier: "chat-upload",
-              generateEmbeddings: true,
-            });
-
-            await ctx.orchestrator.generateEmbeddingsForDocument(documentId);
+              {
+                sourceIdentifier: "chat-upload",
+                generateEmbeddings: true,
+              }
+            );
 
             return {
               success: true,
@@ -1066,7 +1068,7 @@ Returns a description or extracted text from the file.`,
               title: documentTitle,
               filesIngested: virtualFiles.length,
               totalFiles: entries.length,
-              nodesCreated: result.nodesCreated,
+              nodesCreated: result.filesProcessed + result.scopesCreated,
               message: `ZIP extracted and ingested: ${virtualFiles.length} files processed.`,
             };
 
@@ -1074,26 +1076,28 @@ Returns a description or extracted text from the file.`,
             // Read and ingest as single file
             const content = await fs.readFile(attachment.filePath, "utf8");
 
-            const result = await ctx.orchestrator.ingestVirtual({
-              virtualFiles: [{ path: attachment.filename, content }],
-              metadata: {
+            const result = await ctx.orchestrator.ingestVirtualSimplified(
+              [{ path: attachment.filename, content }],
+              projectId,
+              {
+                projectId,
                 documentId,
                 documentTitle,
                 userId: ctx.userId || "chat-user",
                 categoryId: "cat-uploads",
                 categorySlug: "uploads",
               },
-              sourceIdentifier: "chat-upload",
-              generateEmbeddings: true,
-            });
-
-            await ctx.orchestrator.generateEmbeddingsForDocument(documentId);
+              {
+                sourceIdentifier: "chat-upload",
+                generateEmbeddings: true,
+              }
+            );
 
             return {
               success: true,
               documentId,
               title: documentTitle,
-              nodesCreated: result.nodesCreated,
+              nodesCreated: result.filesProcessed + result.scopesCreated,
               message: `Document "${documentTitle}" has been ingested and is now searchable.`,
             };
 
@@ -1141,9 +1145,11 @@ ${ocrProvider === "claude" && attachment.fileType === "pdf" ? "- **OCR Provider*
 ${description || "(No description available)"}
 `;
 
-            const result = await ctx.orchestrator.ingestVirtual({
-              virtualFiles: [{ path: `${attachment.filename}.md`, content: mdContent }],
-              metadata: {
+            const result = await ctx.orchestrator.ingestVirtualSimplified(
+              [{ path: `${attachment.filename}.md`, content: mdContent }],
+              projectId,
+              {
+                projectId,
                 documentId,
                 documentTitle,
                 userId: ctx.userId || "chat-user",
@@ -1152,11 +1158,11 @@ ${description || "(No description available)"}
                 mediaType: attachment.fileType,
                 originalFile: attachment.filePath,
               },
-              sourceIdentifier: "chat-upload-media",
-              generateEmbeddings: true,
-            });
-
-            await ctx.orchestrator.generateEmbeddingsForDocument(documentId);
+              {
+                sourceIdentifier: "chat-upload-media",
+                generateEmbeddings: true,
+              }
+            );
 
             return {
               success: true,
@@ -1165,7 +1171,7 @@ ${description || "(No description available)"}
               type: attachment.fileType,
               ocrProvider: attachment.fileType === "pdf" ? ocrProvider : undefined,
               ocrConfidence,
-              nodesCreated: result.nodesCreated,
+              nodesCreated: result.filesProcessed + result.scopesCreated,
               hasDescription: !!description,
               message: `${attachment.fileType.toUpperCase()} "${documentTitle}" ingested${attachment.fileType === "pdf" ? ` (OCR: ${ocrProvider})` : ""}. Now searchable.`,
             };
@@ -1237,9 +1243,11 @@ ${globalDescription || "(No description available)"}
 ${viewDescriptions.length > 0 ? `## View Descriptions\n${viewDescriptions.map(v => `### ${v.view}\n${v.description}`).join("\n\n")}` : ""}
 `;
 
-            const result = await ctx.orchestrator.ingestVirtual({
-              virtualFiles: [{ path: `${attachment.filename}.md`, content: mdContent }],
-              metadata: {
+            const result = await ctx.orchestrator.ingestVirtualSimplified(
+              [{ path: `${attachment.filename}.md`, content: mdContent }],
+              projectId,
+              {
+                projectId,
                 documentId,
                 documentTitle,
                 userId: ctx.userId || "chat-user",
@@ -1249,11 +1257,11 @@ ${viewDescriptions.length > 0 ? `## View Descriptions\n${viewDescriptions.map(v 
                 originalFile: attachment.filePath,
                 renderedViews: renders.map(r => r.path),
               },
-              sourceIdentifier: "chat-upload-3d",
-              generateEmbeddings: true,
-            });
-
-            await ctx.orchestrator.generateEmbeddingsForDocument(documentId);
+              {
+                sourceIdentifier: "chat-upload-3d",
+                generateEmbeddings: true,
+              }
+            );
 
             return {
               success: true,
@@ -1262,7 +1270,7 @@ ${viewDescriptions.length > 0 ? `## View Descriptions\n${viewDescriptions.map(v 
               type: "3d",
               viewsRendered: renders.length,
               viewsDescribed: viewDescriptions.length,
-              nodesCreated: result.nodesCreated,
+              nodesCreated: result.filesProcessed + result.scopesCreated,
               hasDescription: !!globalDescription,
               message: `3D model "${documentTitle}" ingested with ${viewDescriptions.length} view descriptions. Now searchable.`,
             };

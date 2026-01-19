@@ -9,8 +9,11 @@
  * Used for filtering in search queries
  */
 export interface CommunityNodeMetadata {
-  // Document identity
-  documentId: string;
+  // Project identity (required - Prisma Project.id)
+  projectId: string;
+
+  // Document/Source identity (optional - Prisma Document.id for source tracking)
+  documentId?: string;
   documentTitle: string;
 
   // User filtering
@@ -38,6 +41,7 @@ export interface CommunityNodeMetadata {
  * Search filters for vector search
  */
 export interface SearchFilters {
+  projectId?: string;
   categoryId?: string;
   categorySlug?: string;
   userId?: string;

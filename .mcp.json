@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "ragforge": {
+      "command": "node",
+      "args": [
+        "/home/luciedefraiteur/LR_CodeRag/community-docs/packages/ragforge-core/dist/esm/cli/index.js",
+        "mcp-server",
+        "--verbose"
+      ],
+      "cwd": "/home/luciedefraiteur/LR_CodeRag/community-docs/packages/ragforge-core"
+    }
+  }
+}

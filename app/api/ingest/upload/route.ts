@@ -246,6 +246,7 @@ const BINARY_DOC_TYPES: DocType[] = ["PDF", "DOCX", "XLSX"];
 async function triggerIngestion(
   document: {
     id: string;
+    projectId: string;
     title: string;
     type: DocType;
     categoryId: string;

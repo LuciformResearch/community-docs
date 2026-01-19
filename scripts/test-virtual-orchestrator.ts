@@ -1,16 +1,18 @@
 /**
- * Test script for CommunityOrchestratorAdapter with Virtual Files
+ * Test script for CommunityIngester with Virtual Files
  *
  * Tests the full pipeline: virtual files → parsing → metadata injection → Neo4j
  *
  * Usage: npx tsx scripts/test-virtual-orchestrator.ts
  */
 
-import { CommunityOrchestratorAdapter } from "../lib/ragforge/orchestrator-adapter";
+import { createCommunityIngester } from "../lib/ragforge/community-ingester";
 import { getNeo4jClient } from "../lib/ragforge/neo4j-client";
+import { Neo4jClient as CoreNeo4jClient } from "@luciformresearch/ragforge";
+import neo4j from "neo4j-driver";
 
 async function main() {
-  console.log("=== Test Virtual Files with Orchestrator ===\n");
+  console.log("=== Test Virtual Files with CommunityIngester ===\n");
 
   // Create virtual file content
   const tsContent = `
@@ -63,32 +65,42 @@ export class OrderService {
 }
 `;
 
-  // Initialize Neo4j and orchestrator
-  const neo4j = getNeo4jClient();
+  // Initialize Neo4j
+  const neo4jClient = getNeo4jClient();
   console.log("Neo4j client obtained");
 
-  const adapter = new CommunityOrchestratorAdapter({
-    neo4j,
-    verbose: true,
+  // Create Neo4j driver for core client
+  const uri = process.env.NEO4J_URI || "bolt://localhost:7687";
+  const username = process.env.NEO4J_USER || "neo4j";
+  const password = process.env.NEO4J_PASSWORD || "password";
+
+  const driver = neo4j.driver(uri, neo4j.auth.basic(username, password));
+
+  // Create core Neo4j client (requires uri, username, password)
+  const coreNeo4jClient = new CoreNeo4jClient({ uri, username, password });
+
+  // Create community ingester
+  const ingester = createCommunityIngester({
+    driver,
+    neo4jClient: coreNeo4jClient,
   });
 
-  console.log("\nInitializing adapter...");
-  await adapter.initialize();
-  console.log("Adapter initialized");
+  const projectId = "test-virtual-project-002";
+  const documentId = "test-virtual-doc-002";
 
   // Test virtual file ingestion
   console.log("\n=== Ingesting virtual file ===");
-  const result = await adapter.ingestVirtual({
-    virtualFiles: [
+  const result = await ingester.ingestVirtual(
+    [
       {
-        path: "src/order-service.ts", // Will be prefixed automatically
+        path: "src/order-service.ts",
         content: tsContent,
       },
     ],
-    // Source identifier - simulating a GitHub repo
-    sourceIdentifier: "github.com/example/order-api",
-    metadata: {
-      documentId: "test-virtual-doc-002",
+    projectId,
+    {
+      projectId,
+      documentId,
       documentTitle: "Order Service Documentation",
       userId: "user-virtual-001",
       userUsername: "virtualuser",
@@ -98,21 +110,24 @@ export class OrderService {
       isPublic: true,
       tags: ["orders", "ecommerce", "typescript"],
     },
-  });
-  // Expected path: /virtual/test-virtual-doc-002/github.com/example/order-api/src/order-service.ts
+    {
+      sourceIdentifier: "github.com/example/order-api",
+    }
+  );
 
   console.log("\n=== Ingestion Results ===");
-  console.log(`Nodes created: ${result.nodesCreated}`);
-  console.log(`Relationships created: ${result.relationshipsCreated}`);
+  console.log(`Files processed: ${result.filesProcessed}`);
+  console.log(`Scopes created: ${result.scopesCreated}`);
+  console.log(`Relations created: ${result.relationsCreated}`);
 
   // Verify nodes in Neo4j
   console.log("\n=== Verifying nodes in Neo4j ===");
-  const queryResult = await neo4j.run(`
-    MATCH (n {documentId: 'test-virtual-doc-002'})
+  const queryResult = await neo4jClient.run(`
+    MATCH (n {documentId: $documentId})
     RETURN labels(n) as labels, n.name as name, n.file as file, n.path as path
     ORDER BY labels(n)[0], n.name
     LIMIT 20
-  `);
+  `, { documentId });
 
   console.log(`Found ${queryResult.records.length} nodes:`);
   for (const record of queryResult.records) {
@@ -124,10 +139,10 @@ export class OrderService {
 
   // Verify the path contains our virtual root components
   console.log("\n=== Verifying path structure ===");
-  const fileResult = await neo4j.run(`
-    MATCH (f:File {documentId: 'test-virtual-doc-002'})
+  const fileResult = await neo4jClient.run(`
+    MATCH (f:File {documentId: $documentId})
     RETURN f.file as file, f.path as path, f.name as name
-  `);
+  `, { documentId });
   const record = fileResult.records[0];
   const filePath = record?.get("file") || record?.get("path");
   const fileName = record?.get("name");
@@ -135,7 +150,7 @@ export class OrderService {
   console.log(`File path: ${filePath}`);
 
   // Check that path contains our virtual components (may be relative)
-  const expectedComponents = ["virtual", "test-virtual-doc-002", "github.com", "example", "order-api"];
+  const expectedComponents = ["github.com", "example", "order-api"];
   const hasAllComponents = expectedComponents.every(c => filePath?.includes(c));
   if (hasAllComponents) {
     console.log("✅ Path contains all virtual root components!");
@@ -145,11 +160,17 @@ export class OrderService {
 
   // Cleanup
   console.log("\n=== Cleanup ===");
-  const deletedCount = await adapter.deleteDocument("test-virtual-doc-002");
+  const deleteResult = await neo4jClient.run(`
+    MATCH (n {documentId: $documentId})
+    DETACH DELETE n
+    RETURN count(n) as deleted
+  `, { documentId });
+  const deletedCount = deleteResult.records[0]?.get("deleted") || 0;
   console.log(`Deleted ${deletedCount} nodes`);
 
-  await adapter.stop();
-  await neo4j.close();
+  await driver.close();
+  await coreNeo4jClient.close();
+  await neo4jClient.close();
 
   console.log("\n=== Test completed successfully! ===");
   console.log("✅ Virtual file ingestion works with full metadata injection");
