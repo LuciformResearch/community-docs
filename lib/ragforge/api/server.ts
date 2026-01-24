@@ -60,6 +60,8 @@ import {
   getOCRService,
   generateRender3DAssetHandler,
   getLocalTimestamp,
+  getRelativePath,
+  getShortDirContext,
   type ThreeDToolsContext,
 } from "@luciformresearch/ragforge";
 import * as fs from "fs/promises";
@@ -1095,6 +1097,7 @@ export class CommunityAPIServer {
         // Use orchestrator's search method which wraps SearchService + post-processing + formatting
         const searchResult = await this.orchestrator.search({
           query,
+          projectId: filters.projectId,
           categorySlug: filters.categorySlug,
           userId: filters.userId,
           documentId: filters.documentId,
@@ -1154,6 +1157,12 @@ export class CommunityAPIServer {
           matchedEntities: r.matchedEntities,
         }));
 
+        // If markdown format, return just the formatted output as plain text
+        if (format === 'markdown' && searchResult.formattedOutput) {
+          reply.type('text/plain');
+          return searchResult.formattedOutput;
+        }
+
         return {
           success: true,
           query,
@@ -1190,6 +1199,8 @@ export class CommunityAPIServer {
         limit?: number;
         contextLines?: number;
         filters?: SearchFilters;
+        format?: 'json' | 'markdown';
+        exploreDepth?: number;
       };
     }>("/grep", async (request, reply) => {
       const {
@@ -1199,6 +1210,8 @@ export class CommunityAPIServer {
         limit = 100,
         contextLines = 0,
         filters = {},
+        format = 'json',
+        exploreDepth = 0,
       } = request.body || {};
 
       if (!pattern) {
@@ -1225,21 +1238,127 @@ export class CommunityAPIServer {
           documentId: filters.documentId,
         });
 
+        const jsonResults = result.results.map(r => ({
+          filePath: r.filePath,
+          matches: r.matches,
+          totalLines: r.totalLines,
+          node: {
+            name: r.node.name || r.node._name,
+            type: r.node.type,
+            labels: r.node.labels,
+            startLine: r.node.startLine,
+            endLine: r.node.endLine,
+          },
+        }));
+
+        // Markdown format: compact grep-style output with optional dependency exploration
+        if (format === 'markdown') {
+          const lines: string[] = [];
+          lines.push(`# Grep: \`${pattern}\``);
+          lines.push(`> ${result.totalMatches} matches in ${result.filesMatched} files\n`);
+
+          // If exploreDepth > 0, collect all matches and rank by Levenshtein distance
+          let matchesToExplore: Array<{ filePath: string; line: number; nodeName: string }> = [];
+          if (exploreDepth > 0) {
+            // Collect all matches with their scope names
+            for (const file of jsonResults) {
+              for (const m of file.matches) {
+                matchesToExplore.push({
+                  filePath: file.filePath,
+                  line: m.line,
+                  nodeName: file.node?.name || '',
+                });
+              }
+            }
+
+            // Levenshtein distance function
+            const levenshtein = (a: string, b: string): number => {
+              const aLower = a.toLowerCase();
+              const bLower = b.toLowerCase();
+              const matrix: number[][] = [];
+              for (let i = 0; i <= bLower.length; i++) matrix[i] = [i];
+              for (let j = 0; j <= aLower.length; j++) matrix[0][j] = j;
+              for (let i = 1; i <= bLower.length; i++) {
+                for (let j = 1; j <= aLower.length; j++) {
+                  matrix[i][j] = bLower[i - 1] === aLower[j - 1]
+                    ? matrix[i - 1][j - 1]
+                    : Math.min(matrix[i - 1][j - 1] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j] + 1);
+                }
+              }
+              return matrix[bLower.length][aLower.length];
+            };
+
+            // Extract searchable term from pattern (remove regex chars)
+            const searchTerm = pattern.replace(/[.*+?^${}()|[\]\\]/g, '').toLowerCase();
+
+            // Sort by Levenshtein distance and take top 5
+            matchesToExplore = matchesToExplore
+              .map(m => ({ ...m, distance: levenshtein(searchTerm, m.nodeName) }))
+              .sort((a, b) => a.distance - b.distance)
+              .slice(0, 5);
+          }
+
+          // Track which matches should be explored
+          const exploreSet = new Set(matchesToExplore.map(m => `${m.filePath}:${m.line}`));
+
+          for (const file of jsonResults) {
+            // Full path for agent tools (read_file needs the full path)
+            lines.push(`## ${file.filePath}`);
+
+            for (const m of file.matches) {
+              // Format: L42: matched content
+              lines.push(`L${m.line}: ${m.content}`);
+
+              // Only explore dependencies for top 5 ranked matches
+              const matchKey = `${file.filePath}:${m.line}`;
+              if (exploreDepth > 0 && exploreSet.has(matchKey) && this.orchestrator) {
+                try {
+                  const hierarchy = await this.orchestrator.extractDependencyHierarchy({
+                    file: file.filePath,
+                    line: m.line,
+                    depth: exploreDepth,
+                    direction: 'consumes',
+                    maxNodes: 10,
+                    includeCodeSnippets: false,
+                    format: 'json',
+                  });
+
+                  if (hierarchy.success && hierarchy.dependencies.length > 0) {
+                    // Format as ASCII tree with paths relative to source file
+                    const deps = hierarchy.dependencies;
+                    const shortContext = getShortDirContext(file.filePath);
+
+                    lines.push(`    └── CONSUMES (${deps.length}) [paths relative to ${shortContext}]`);
+                    for (let i = 0; i < deps.length; i++) {
+                      const dep = deps[i];
+                      const isLast = i === deps.length - 1;
+                      const connector = isLast ? '└── ' : '├── ';
+                      const relPath = getRelativePath(file.filePath, dep.file);
+                      const depthIndicator = dep.depth > 1 ? `↳${dep.depth} ` : '';
+                      lines.push(`        ${connector}${depthIndicator}[${dep.type}] ${dep.name} (${relPath}:${dep.startLine})`);
+                    }
+                  }
+                } catch (hierarchyErr) {
+                  // Silently ignore hierarchy errors for individual matches
+                }
+              }
+            }
+            lines.push('');
+          }
+
+          return {
+            success: true,
+            pattern,
+            markdown: lines.join('\n'),
+            totalMatches: result.totalMatches,
+            filesMatched: result.filesMatched,
+          };
+        }
+
         return {
           success: true,
           pattern,
-          results: result.results.map(r => ({
-            filePath: r.filePath,
-            matches: r.matches,
-            totalLines: r.totalLines,
-            node: {
-              name: r.node.name || r.node._name,
-              type: r.node.type,
-              labels: r.node.labels,
-              startLine: r.node.startLine,
-              endLine: r.node.endLine,
-            },
-          })),
+          results: jsonResults,
           totalMatches: result.totalMatches,
           filesMatched: result.filesMatched,
         };

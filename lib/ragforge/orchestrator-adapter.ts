@@ -60,6 +60,9 @@ import {
   type ProcessingStats,
   type GitHubDownloadOptions,
   type ZipExtractOptions,
+  // Path utilities
+  getRelativePath,
+  getShortDirContext,
 } from "@luciformresearch/ragforge";
 import type { Neo4jClient } from "./neo4j-client";
 import neo4j from "neo4j-driver";
@@ -161,6 +164,9 @@ export interface CommunitySearchOptions {
 
   /** Explore relationships depth (1-3, 0 = disabled) */
   exploreDepth?: number;
+
+  /** Max number of relevant dependencies to keep after semantic filtering (default: 20) */
+  exploreTopK?: number;
 
   /** Summarize results with LLM */
   summarize?: boolean;
@@ -1277,6 +1283,9 @@ export class CommunityOrchestratorAdapter {
     // Build community-specific filters
     const filters: SearchFilter[] = [];
 
+    if (options.projectId) {
+      filters.push({ property: "projectId", operator: "eq", value: options.projectId });
+    }
     if (options.categorySlug) {
       filters.push({ property: "categorySlug", operator: "eq", value: options.categorySlug });
     }
@@ -1510,6 +1519,38 @@ export class CommunityOrchestratorAdapter {
       if (graph && graph.nodes.length > 0) {
         relationshipsExplored = true;
         logger.info(`[CommunityOrchestrator] Found ${graph.nodes.length} nodes, ${graph.edges.length} edges`);
+
+        // Filter graph nodes by semantic relevance to query
+        // Get UUIDs of non-search-result nodes (dependencies)
+        const dependencyUuids = graph.nodes
+          .filter(n => !n.isSearchResult)
+          .map(n => n.uuid);
+
+        if (dependencyUuids.length > 0 && this.searchService) {
+          // Do a hybrid search filtered to dependency UUIDs
+          const depSearchResult = await this.searchService.search({
+            query: options.query,
+            semantic: true,
+            hybrid: true,
+            limit: Math.min(dependencyUuids.length, options.exploreTopK ?? 20),
+            minScore: 0.3,
+            uuids: dependencyUuids,
+          });
+
+          // Keep only relevant dependency nodes
+          const relevantUuids = new Set(depSearchResult.results.map(r => r.node.uuid as string));
+          // Also keep all search result nodes
+          const searchResultUuids = new Set(graph.nodes.filter(n => n.isSearchResult).map(n => n.uuid));
+
+          // Filter nodes
+          graph.nodes = graph.nodes.filter(n => relevantUuids.has(n.uuid) || searchResultUuids.has(n.uuid));
+
+          // Filter edges to only include those between remaining nodes
+          const remainingUuids = new Set(graph.nodes.map(n => n.uuid));
+          graph.edges = graph.edges.filter(e => remainingUuids.has(e.from) && remainingUuids.has(e.to));
+
+          logger.info(`[CommunityOrchestrator] Filtered graph to ${graph.nodes.length} relevant nodes`);
+        }
       }
     }
 
@@ -1547,6 +1588,7 @@ export class CommunityOrchestratorAdapter {
           projectId: r.node.projectId || "unknown",
           projectPath: r.node.absolutePath || r.filePath || "",
           filePath: r.node.absolutePath || r.filePath || r.node.file || "",
+          matchedRange: r.matchedRange,
         })),
         totalCount: result.totalCount,
         searchedProjects: [], // community-docs uses Prisma projects
@@ -1787,7 +1829,8 @@ export class CommunityOrchestratorAdapter {
             ORDER BY depth_level, dep.name
             LIMIT $maxNodes
             RETURN DISTINCT dep.uuid AS uuid, dep.name AS name, dep.type AS type,
-                   dep.file AS file, dep.startLine AS startLine, dep.endLine AS endLine,
+                   COALESCE(dep.absolutePath, dep.file) AS file,
+                   dep.startLine AS startLine, dep.endLine AS endLine,
                    dep.source AS source, depth_level AS depth
           `,
           type: 'consumes',
@@ -1803,7 +1846,8 @@ export class CommunityOrchestratorAdapter {
             ORDER BY depth_level, consumer.name
             LIMIT $maxNodes
             RETURN DISTINCT consumer.uuid AS uuid, consumer.name AS name, consumer.type AS type,
-                   consumer.file AS file, consumer.startLine AS startLine, consumer.endLine AS endLine,
+                   COALESCE(consumer.absolutePath, consumer.file) AS file,
+                   consumer.startLine AS startLine, consumer.endLine AS endLine,
                    consumer.source AS source, depth_level AS depth
           `,
           type: 'consumed_by',
@@ -1927,14 +1971,18 @@ export class CommunityOrchestratorAdapter {
   }): string {
     const lines: string[] = [];
     const { root, dependencies, consumers } = data;
+    const rootFile = root.file;
 
-    // Helper to format node header
-    const formatNodeHeader = (node: { name: string; type: string; file: string; startLine: number; endLine?: number }): string => {
+    // Helper to format node header with relative paths
+    const formatNodeHeader = (node: { name: string; type: string; file: string; startLine: number; endLine?: number }, isRoot = false): string => {
       const lineInfo = node.endLine && node.endLine !== node.startLine
         ? `${node.startLine}-${node.endLine}`
         : `${node.startLine}`;
-      const fileName = node.file.split('/').pop() || node.file;
-      return `[${node.type}] ${node.name} (${fileName}:${lineInfo})`;
+      // Root shows filename, dependencies/consumers show relative path from root
+      const pathDisplay = isRoot
+        ? (node.file.split('/').pop() || node.file)
+        : getRelativePath(rootFile, node.file);
+      return `[${node.type}] ${node.name} (${pathDisplay}:${lineInfo})`;
     };
 
     // Helper to add snippet lines with proper prefix
@@ -1949,12 +1997,14 @@ export class CommunityOrchestratorAdapter {
       lines.push(`${continuationPrefix}┈┈┈`);
     };
 
-    // Title
+    // Title with path context
+    const shortContext = getShortDirContext(rootFile);
     lines.push('## Dependency Hierarchy');
+    lines.push(`*Paths relative to ${shortContext}*`);
     lines.push('');
 
     // Root node
-    lines.push(`◉ ${formatNodeHeader(root)}`);
+    lines.push(`◉ ${formatNodeHeader(root, true)}`);
     if (root.snippet) {
       const snippetLines = root.snippet.split('\n');
       lines.push('│ ┈┈┈');
