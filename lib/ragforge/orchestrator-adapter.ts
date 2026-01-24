@@ -62,6 +62,7 @@ import {
   type ZipExtractOptions,
 } from "@luciformresearch/ragforge";
 import type { Neo4jClient } from "./neo4j-client";
+import neo4j from "neo4j-driver";
 import type { CommunityNodeMetadata } from "./types";
 import { getPipelineLogger } from "./logger";
 import type { EntityEmbeddingService, EntitySearchResult } from "./entity-embedding-service";
@@ -145,6 +146,11 @@ export interface CommunitySearchOptions {
 
   /** Glob pattern to filter results by file path (e.g. match .ts files) */
   glob?: string;
+
+  // === Node type filtering ===
+
+  /** Neo4j labels to filter (e.g., ['Scope'] for code only, ['MarkdownSection'] for docs) */
+  labels?: string[];
 
   // === Post-processing options (from @ragforge/core) ===
 
@@ -1308,6 +1314,7 @@ export class CommunityOrchestratorAdapter {
       minScore: options.minScore ?? 0.3,
       filters,
       glob: options.glob,
+      labels: options.labels,
     });
 
     // Map to community format with snippets
@@ -1639,7 +1646,7 @@ export class CommunityOrchestratorAdapter {
       `[CommunityOrchestrator] Grep: "${options.pattern}" (glob: ${options.glob || '*'}, filters: ${filters.length})`
     );
 
-    return this.searchService.grep({
+    return this.searchService.grepVirtual({
       pattern: options.pattern,
       ignoreCase: options.ignoreCase,
       glob: options.glob,
@@ -1647,6 +1654,371 @@ export class CommunityOrchestratorAdapter {
       contextLines: options.contextLines,
       filters,
     });
+  }
+
+  /**
+   * Extract dependency hierarchy for a scope at file:line
+   *
+   * Finds the scope containing the given line and returns its dependency graph:
+   * - CONSUMES: what the scope depends on (imports, calls)
+   * - CONSUMED_BY: what uses this scope (consumers)
+   *
+   * @param options - file path, line number, depth, direction
+   * @returns Dependency hierarchy with root scope, dependencies, consumers, and graph
+   */
+  async extractDependencyHierarchy(options: {
+    file: string;
+    line: number;
+    depth?: number;
+    direction?: 'both' | 'consumes' | 'consumed_by';
+    maxNodes?: number;
+    includeCodeSnippets?: boolean;
+    codeSnippetLines?: number;
+    format?: 'json' | 'markdown';
+  }): Promise<{
+    success: boolean;
+    error?: string;
+    root: {
+      uuid: string;
+      name: string;
+      type: string;
+      file: string;
+      startLine: number;
+      endLine: number;
+      snippet?: string;
+    } | null;
+    dependencies: Array<{
+      uuid: string;
+      name: string;
+      type: string;
+      file: string;
+      startLine: number;
+      endLine: number;
+      depth: number;
+      snippet?: string;
+    }>;
+    consumers: Array<{
+      uuid: string;
+      name: string;
+      type: string;
+      file: string;
+      startLine: number;
+      endLine: number;
+      depth: number;
+      snippet?: string;
+    }>;
+    graph: {
+      nodes: Array<{ uuid: string; name: string; type: string; file: string; startLine: number; endLine: number }>;
+      edges: Array<{ from: string; to: string; type: string; depth: number }>;
+    };
+    formattedOutput?: string;
+  }> {
+    await this.initialize();
+
+    const {
+      file,
+      line,
+      depth = 2,
+      direction = 'both',
+      maxNodes = 50,
+      includeCodeSnippets = true,
+      codeSnippetLines = 10,
+      format = 'json',
+    } = options;
+
+    const toNumber = (value: any): number => {
+      if (typeof value === 'number') return value;
+      if (value?.toNumber) return value.toNumber();
+      return 0;
+    };
+
+    try {
+      // 1. Find scope at file:line (smallest scope containing that line)
+      // s.file contains just the filename, so we need to join with File node
+      // or match via DEFINED_IN relationship
+      const result = await this.neo4j.run(
+        `MATCH (s:Scope)-[:DEFINED_IN]->(f:File)
+         WHERE f.absolutePath ENDS WITH $file
+           AND s.startLine IS NOT NULL
+           AND s.endLine IS NOT NULL
+           AND s.startLine <= $line
+           AND s.endLine >= $line
+           AND NOT s:MarkdownSection
+           AND NOT s:WebPage
+         RETURN s.uuid AS uuid, s.name AS name, s.type AS type,
+                s.startLine AS startLine, s.endLine AS endLine,
+                f.absolutePath AS file, s.source AS source
+         ORDER BY (s.endLine - s.startLine) ASC
+         LIMIT 1`,
+        { file, line: neo4j.int(line) }
+      );
+
+      const scopeResult = result.records.length > 0 ? result : null;
+
+      if (!scopeResult || scopeResult.records.length === 0) {
+        return {
+          success: false,
+          error: `No scope found at ${file}:${line}`,
+          root: null,
+          dependencies: [],
+          consumers: [],
+          graph: { nodes: [], edges: [] },
+        };
+      }
+
+      const rootRecord = scopeResult.records[0];
+      const rootUuid = rootRecord.get('uuid') as string;
+      const rootName = rootRecord.get('name') as string;
+      const rootType = rootRecord.get('type') as string;
+      const rootFile = rootRecord.get('file') as string;
+      const rootStartLine = toNumber(rootRecord.get('startLine'));
+      const rootEndLine = toNumber(rootRecord.get('endLine'));
+      const rootSource = rootRecord.get('source') as string | null;
+
+      // 2. Build Cypher query to extract hierarchy
+      const queries: Array<{ query: string; type: 'consumes' | 'consumed_by' }> = [];
+
+      if (direction === 'both' || direction === 'consumes') {
+        queries.push({
+          query: `
+            MATCH path = (root:Scope {uuid: $rootUuid})-[:CONSUMES*1..${depth}]->(dep:Scope)
+            WHERE NOT dep.uuid = $rootUuid
+            WITH dep, length(path) AS depth_level
+            ORDER BY depth_level, dep.name
+            LIMIT $maxNodes
+            RETURN DISTINCT dep.uuid AS uuid, dep.name AS name, dep.type AS type,
+                   dep.file AS file, dep.startLine AS startLine, dep.endLine AS endLine,
+                   dep.source AS source, depth_level AS depth
+          `,
+          type: 'consumes',
+        });
+      }
+
+      if (direction === 'both' || direction === 'consumed_by') {
+        queries.push({
+          query: `
+            MATCH path = (consumer:Scope)-[:CONSUMES*1..${depth}]->(root:Scope {uuid: $rootUuid})
+            WHERE NOT consumer.uuid = $rootUuid
+            WITH consumer, length(path) AS depth_level
+            ORDER BY depth_level, consumer.name
+            LIMIT $maxNodes
+            RETURN DISTINCT consumer.uuid AS uuid, consumer.name AS name, consumer.type AS type,
+                   consumer.file AS file, consumer.startLine AS startLine, consumer.endLine AS endLine,
+                   consumer.source AS source, depth_level AS depth
+          `,
+          type: 'consumed_by',
+        });
+      }
+
+      // 3. Execute queries and build results
+      const dependencies: Array<any> = [];
+      const consumers: Array<any> = [];
+      const nodes = new Map<string, any>();
+      const edges: Array<any> = [];
+
+      // Add root node
+      const rootSnippet = includeCodeSnippets && rootSource
+        ? rootSource.split('\n').slice(0, codeSnippetLines).join('\n')
+        : undefined;
+
+      nodes.set(rootUuid, {
+        uuid: rootUuid,
+        name: rootName,
+        type: rootType,
+        file: rootFile,
+        startLine: rootStartLine,
+        endLine: rootEndLine,
+      });
+
+      for (const { query, type } of queries) {
+        const result = await this.neo4j.run(query, { rootUuid, maxNodes: neo4j.int(maxNodes) });
+
+        for (const record of result.records) {
+          const uuid = record.get('uuid') as string;
+          const name = record.get('name') as string;
+          const nodeType = record.get('type') as string;
+          const nodeFile = record.get('file') as string;
+          const startLine = toNumber(record.get('startLine'));
+          const endLine = toNumber(record.get('endLine'));
+          const source = record.get('source') as string | null;
+          const depthLevel = toNumber(record.get('depth'));
+
+          const snippet = includeCodeSnippets && source
+            ? source.split('\n').slice(0, codeSnippetLines).join('\n')
+            : undefined;
+
+          const nodeData = {
+            uuid,
+            name,
+            type: nodeType,
+            file: nodeFile,
+            startLine,
+            endLine,
+            depth: depthLevel,
+            snippet,
+          };
+
+          nodes.set(uuid, { uuid, name, type: nodeType, file: nodeFile, startLine, endLine });
+
+          if (type === 'consumes') {
+            dependencies.push(nodeData);
+            edges.push({ from: rootUuid, to: uuid, type: 'CONSUMES', depth: depthLevel });
+          } else {
+            consumers.push(nodeData);
+            edges.push({ from: uuid, to: rootUuid, type: 'CONSUMES', depth: depthLevel });
+          }
+        }
+      }
+
+      logger.info(
+        `[CommunityOrchestrator] Hierarchy extracted for ${rootName}: ` +
+        `${dependencies.length} dependencies, ${consumers.length} consumers`
+      );
+
+      // Format as ASCII tree if requested
+      let formattedOutput: string | undefined;
+      if (format === 'markdown') {
+        formattedOutput = this.formatHierarchyAsMarkdown({
+          root: { uuid: rootUuid, name: rootName, type: rootType, file: rootFile, startLine: rootStartLine, endLine: rootEndLine, snippet: rootSnippet },
+          dependencies,
+          consumers,
+        });
+      }
+
+      return {
+        success: true,
+        root: {
+          uuid: rootUuid,
+          name: rootName,
+          type: rootType,
+          file: rootFile,
+          startLine: rootStartLine,
+          endLine: rootEndLine,
+          snippet: rootSnippet,
+        },
+        dependencies,
+        consumers,
+        graph: {
+          nodes: Array.from(nodes.values()),
+          edges,
+        },
+        formattedOutput,
+      };
+    } catch (error: any) {
+      logger.error(`[CommunityOrchestrator] Hierarchy extraction failed: ${error.message}`);
+      return {
+        success: false,
+        error: error.message,
+        root: null,
+        dependencies: [],
+        consumers: [],
+        graph: { nodes: [], edges: [] },
+      };
+    }
+  }
+
+  /**
+   * Format hierarchy as ASCII tree markdown with inline code snippets
+   */
+  private formatHierarchyAsMarkdown(data: {
+    root: { uuid: string; name: string; type: string; file: string; startLine: number; endLine: number; snippet?: string };
+    dependencies: Array<{ uuid: string; name: string; type: string; file: string; startLine: number; endLine: number; depth: number; snippet?: string }>;
+    consumers: Array<{ uuid: string; name: string; type: string; file: string; startLine: number; endLine: number; depth: number; snippet?: string }>;
+  }): string {
+    const lines: string[] = [];
+    const { root, dependencies, consumers } = data;
+
+    // Helper to format node header
+    const formatNodeHeader = (node: { name: string; type: string; file: string; startLine: number; endLine?: number }): string => {
+      const lineInfo = node.endLine && node.endLine !== node.startLine
+        ? `${node.startLine}-${node.endLine}`
+        : `${node.startLine}`;
+      const fileName = node.file.split('/').pop() || node.file;
+      return `[${node.type}] ${node.name} (${fileName}:${lineInfo})`;
+    };
+
+    // Helper to add snippet lines with proper prefix
+    const addSnippetLines = (snippet: string | undefined, prefix: string, isLastNode: boolean): void => {
+      if (!snippet) return;
+      const snippetLines = snippet.split('\n');
+      const continuationPrefix = prefix + (isLastNode ? '    ' : '│   ');
+      lines.push(`${continuationPrefix}┈┈┈`);
+      for (const snippetLine of snippetLines) {
+        lines.push(`${continuationPrefix}${snippetLine}`);
+      }
+      lines.push(`${continuationPrefix}┈┈┈`);
+    };
+
+    // Title
+    lines.push('## Dependency Hierarchy');
+    lines.push('');
+
+    // Root node
+    lines.push(`◉ ${formatNodeHeader(root)}`);
+    if (root.snippet) {
+      const snippetLines = root.snippet.split('\n');
+      lines.push('│ ┈┈┈');
+      for (const snippetLine of snippetLines) {
+        lines.push(`│ ${snippetLine}`);
+      }
+      lines.push('│ ┈┈┈');
+    }
+
+    const hasDeps = dependencies.length > 0;
+    const hasCons = consumers.length > 0;
+
+    // Dependencies (CONSUMES - what root uses)
+    if (hasDeps) {
+      const branchPrefix = hasCons ? '├' : '└';
+      lines.push(`${branchPrefix}── CONSUMES (${dependencies.length} dependencies)`);
+
+      const depPrefix = hasCons ? '│   ' : '    ';
+
+      for (let i = 0; i < dependencies.length; i++) {
+        const node = dependencies[i];
+        const isLast = i === dependencies.length - 1;
+        const connector = isLast ? '└── ' : '├── ';
+        const depthIndicator = node.depth > 1 ? `↳${node.depth} ` : '';
+        lines.push(`${depPrefix}${connector}${depthIndicator}${formatNodeHeader(node)}`);
+
+        if (node.snippet) {
+          const snippetPrefix = depPrefix + (isLast ? '    ' : '│   ');
+          const snippetLines = node.snippet.split('\n');
+          lines.push(`${snippetPrefix}┈┈┈`);
+          for (const snippetLine of snippetLines) {
+            lines.push(`${snippetPrefix}${snippetLine}`);
+          }
+          lines.push(`${snippetPrefix}┈┈┈`);
+        }
+      }
+    }
+
+    // Consumers (CONSUMED_BY - what uses root)
+    if (hasCons) {
+      lines.push(`└── CONSUMED_BY (${consumers.length} consumers)`);
+
+      const consPrefix = '    ';
+
+      for (let i = 0; i < consumers.length; i++) {
+        const node = consumers[i];
+        const isLast = i === consumers.length - 1;
+        const connector = isLast ? '└── ' : '├── ';
+        const depthIndicator = node.depth > 1 ? `↳${node.depth} ` : '';
+        lines.push(`${consPrefix}${connector}${depthIndicator}${formatNodeHeader(node)}`);
+
+        if (node.snippet) {
+          const snippetPrefix = consPrefix + (isLast ? '    ' : '│   ');
+          const snippetLines = node.snippet.split('\n');
+          lines.push(`${snippetPrefix}┈┈┈`);
+          for (const snippetLine of snippetLines) {
+            lines.push(`${snippetPrefix}${snippetLine}`);
+          }
+          lines.push(`${snippetPrefix}┈┈┈`);
+        }
+      }
+    }
+
+    return lines.join('\n');
   }
 
   /**

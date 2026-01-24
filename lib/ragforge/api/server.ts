@@ -1044,6 +1044,8 @@ export class CommunityAPIServer {
         maxSourceResults?: number;
         // File path filtering
         glob?: string;
+        // Node type filtering (Neo4j labels)
+        labels?: string[];
       };
     }>("/search", async (request, reply) => {
       const {
@@ -1067,6 +1069,8 @@ export class CommunityAPIServer {
         maxSourceResults,
         // File path filtering
         glob,
+        // Node type filtering
+        labels,
       } = request.body || {};
 
       if (!query) {
@@ -1102,6 +1106,8 @@ export class CommunityAPIServer {
           minScore,
           // File path filtering
           glob,
+          // Node type filtering (Neo4j labels: ['Scope'] for code only)
+          labels,
           // Post-processing options
           boostKeywords,
           boostWeight,
@@ -1239,6 +1245,162 @@ export class CommunityAPIServer {
         };
       } catch (err: any) {
         logger.error(`Grep failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // =========================================================================
+    // Dependency Hierarchy (extract CONSUMES/CONSUMED_BY relationships for a scope)
+    // =========================================================================
+    this.server.post<{
+      Body: {
+        file: string;
+        line: number;
+        depth?: number;
+        direction?: 'both' | 'consumes' | 'consumed_by';
+        maxNodes?: number;
+        includeCodeSnippets?: boolean;
+        codeSnippetLines?: number;
+        format?: 'json' | 'markdown';
+      };
+    }>("/hierarchy", async (request, reply) => {
+      const {
+        file,
+        line,
+        depth = 2,
+        direction = 'both',
+        maxNodes = 50,
+        includeCodeSnippets = true,
+        codeSnippetLines = 10,
+        format = 'json',
+      } = request.body || {};
+
+      if (!file || line === undefined) {
+        reply.status(400);
+        return { success: false, error: "Missing file or line" };
+      }
+
+      if (!this.orchestrator) {
+        reply.status(503);
+        return { success: false, error: "Orchestrator not available" };
+      }
+
+      logger.info(`Hierarchy: ${file}:${line} (depth: ${depth}, direction: ${direction}, format: ${format})`);
+
+      try {
+        const result = await this.orchestrator.extractDependencyHierarchy({
+          file,
+          line,
+          depth,
+          direction,
+          maxNodes,
+          includeCodeSnippets,
+          codeSnippetLines,
+          format,
+        });
+
+        return result;
+      } catch (err: any) {
+        logger.error(`Hierarchy extraction failed: ${err.message}`);
+        reply.status(500);
+        return { success: false, error: err.message };
+      }
+    });
+
+    // =========================================================================
+    // Read File (virtual files from Neo4j _rawContent)
+    // =========================================================================
+    this.server.post<{
+      Body: {
+        /** File path (can be partial, will match with ENDS WITH) */
+        path: string;
+        /** Start line (0-based, optional) */
+        offset?: number;
+        /** Max lines to read (default: 2000) */
+        limit?: number;
+        /** Project ID filter (optional) */
+        projectId?: string;
+      };
+    }>("/read-file", async (request, reply) => {
+      const {
+        path: filePath,
+        offset = 0,
+        limit = 2000,
+        projectId,
+      } = request.body || {};
+
+      if (!filePath) {
+        reply.status(400);
+        return { success: false, error: "Missing path" };
+      }
+
+      if (!this.neo4j) {
+        reply.status(503);
+        return { success: false, error: "Database not available" };
+      }
+
+      logger.info(`Read file: ${filePath} (offset: ${offset}, limit: ${limit})`);
+
+      try {
+        // Find the file in Neo4j
+        const query = projectId
+          ? `MATCH (f:File)
+             WHERE f.absolutePath ENDS WITH $path AND f.projectId = $projectId
+             RETURN f.absolutePath AS absolutePath, f._rawContent AS content, f.name AS name
+             LIMIT 1`
+          : `MATCH (f:File)
+             WHERE f.absolutePath ENDS WITH $path
+             RETURN f.absolutePath AS absolutePath, f._rawContent AS content, f.name AS name
+             LIMIT 1`;
+
+        const result = await this.neo4j.run(query, { path: filePath, projectId });
+
+        if (result.records.length === 0) {
+          reply.status(404);
+          return { success: false, error: `File not found: ${filePath}` };
+        }
+
+        const record = result.records[0];
+        const absolutePath = record.get('absolutePath') as string;
+        const content = record.get('content') as string | null;
+        const name = record.get('name') as string;
+
+        if (!content) {
+          reply.status(404);
+          return { success: false, error: `No content stored for file: ${absolutePath}` };
+        }
+
+        // Split into lines and apply offset/limit
+        const allLines = content.split('\n');
+        const totalLines = allLines.length;
+        const startLine = Math.max(0, Math.min(offset, totalLines));
+        const endLine = Math.min(startLine + limit, totalLines);
+        const selectedLines = allLines.slice(startLine, endLine);
+
+        // Format with line numbers (1-indexed for display, matching read_file format)
+        const maxLineNum = endLine;
+        const lineNumWidth = Math.max(5, String(maxLineNum).length);
+        const formattedLines = selectedLines.map((line, idx) => {
+          const lineNum = String(startLine + idx + 1).padStart(lineNumWidth, '0');
+          // Truncate long lines
+          const truncatedLine = line.length > 2000 ? line.substring(0, 2000) + '...' : line;
+          return `${lineNum}| ${truncatedLine}`;
+        });
+
+        return {
+          success: true,
+          path: absolutePath,
+          name,
+          content: formattedLines.join('\n'),
+          totalLines,
+          offset: startLine,
+          limit,
+          linesReturned: selectedLines.length,
+          hasMore: endLine < totalLines,
+        };
+      } catch (err: any) {
+        logger.error(`Read file failed: ${err.message}`);
         reply.status(500);
         return { success: false, error: err.message };
       }
